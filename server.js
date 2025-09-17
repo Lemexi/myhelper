@@ -1,4 +1,5 @@
-// server.js
+// server.js — RenovoGo LLM backend (чистый, без дублей, с chat_id)
+// Запуск: node server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -24,13 +25,18 @@ const REPLY_MAX_TOKENS = Number(process.env.REPLY_MAX_TOKENS || 400);
 const TEMPERATURE = Number(process.env.TEMPERATURE || 0.7);
 const TOP_P = Number(process.env.TOP_P || 0.9);
 
-// ===== utils =====
-const Msg = z.object({ role: z.enum(['system','user','assistant']), content: z.string().min(1) });
+// ===== utils & schemas =====
+const Msg = z.object({
+  role: z.enum(['system', 'user', 'assistant']),
+  content: z.string().min(1)
+});
+
 const BodySchema = z.object({
   message: z.string().min(1),
   history: z.array(Msg).optional(),
-  mode: z.enum(['auto','expert','fallback']).optional().default('auto'),
-  language: z.string().optional() // принудительный язык ответа (опционально)
+  mode: z.enum(['auto', 'expert', 'fallback']).optional().default('auto'),
+  language: z.string().optional(),     // принудительный язык ответа (опционально)
+  chat_id: z.string().optional()       // телеграм-сессия (опционально)
 });
 
 function pickModel(mode) {
@@ -52,15 +58,19 @@ function truncateHistory(history = [], maxChars = 12000) {
 }
 
 // ===== health =====
+app.get('/', (_, res) => res.type('text/plain').send('OK Renovogo backend'));
 app.get('/health', (_, res) => res.json({ ok: true, model: MODEL_PRIMARY }));
 
 // ===== main reply =====
 app.post('/api/reply', async (req, res) => {
   let payload;
-  try { payload = BodySchema.parse(req.body); }
-  catch (e) { return res.status(400).json({ error: 'Bad request', details: e.errors }); }
+  try {
+    payload = BodySchema.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: 'Bad request', details: e.errors });
+  }
 
-  const { message, history = [], mode, language } = payload;
+  const { message, history = [], mode, language /*, chat_id */ } = payload;
   const model = pickModel(mode);
 
   // Собираем сообщения для LLM
@@ -77,16 +87,11 @@ app.post('/api/reply', async (req, res) => {
       messages: msgs,
       temperature: TEMPERATURE,
       top_p: TOP_P,
-      max_tokens: REPLY_MAX_TOKENS,
-      // безопасный JSON-выход можно включать при необходимости: response_format: { type: 'json_object' }
+      max_tokens: REPLY_MAX_TOKENS
     });
 
     const text = resp.choices?.[0]?.message?.content?.trim() || '';
-    return res.json({
-      ok: true,
-      model,
-      reply: text
-    });
+    return res.json({ ok: true, model, reply: text });
   } catch (err) {
     // Fallback на 8B, если первичная модель недоступна
     try {
