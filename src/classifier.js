@@ -2,21 +2,16 @@
 
 // Нормализация и чистка цитат/префиксов
 export function norm(s = "") {
-  // аккуратно приводим пробелы и кавычки
-  return (s || "")
-    .replace(/\s+/g, " ")
-    .replace(/[«»“”"'\u00A0]/g, '"')
-    .trim();
+  return (s || "").replace(/\s+/g, " ").replace(/[«»"""'\u00A0]/g, '"').trim();
 }
 export function lower(s = "") { return norm(s).toLowerCase(); }
-
 export function stripQuoted(raw = "") {
   const lines = (raw || "").split(/\r?\n/);
   const clean = [];
   for (const ln of lines) {
     const l = ln.trim();
     if (!l) continue;
-    if (l.startsWith(">")) continue; // цитаты
+    if (l.startsWith(">")) continue;                                   // цитаты
     if (/^assistant\b|renovogo\.com|^bot\b|^from:|^replying to/i.test(l)) continue; // шапки
     clean.push(l);
   }
@@ -24,34 +19,24 @@ export function stripQuoted(raw = "") {
 }
 
 /* ─────────── Триггеры-команды ─────────── */
-
-// «Я бы ответил/а …» — ловим варианты порядка слов и женскую форму
+// Принимаем любые формы: с/без двоеточия, в любом месте строки
 export function isCmdTeach(raw = "") {
   const t = lower(stripQuoted(raw));
-  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)(?=\s|:|,|-|$)/i.test(t);
+  return /(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\b/.test(t);
 }
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)[\s:,\-]*([\s\S]+)$/i;
-  const m = t.match(re);
-  // группы: [0]=вся строка, [1]=триггер, [2]/[3]/[4]/[5] — подгруппы (не важны), [6]=текст ответа
-  // но проще и безопаснее взять последнюю группу через .pop():
-  if (!m) return null;
-  const groups = Array.from(m);
-  const last = groups.pop();
-  return (last || "").trim() || null;
+  const m = t.match(/(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\s*[:\-,]?\s*(.+)$/is);
+  return m ? m[2].trim() : null;
 }
 
-// Перевод: поддержим «переведи», «переклади», «translate (to)», флагами займёмся в translator.js
 export function isCmdTranslate(raw = "") {
   const t = lower(stripQuoted(raw));
-  return /\b(переведи|переклади|translate)\b/.test(t);
+  return /\bпереведи(\s+на\s+[a-zA-ZА-Яа-яёіїєґ]+)?\b/.test(t);
 }
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  // варианты: "переведи на англ: Текст", "переклади на польську Текст", "translate to en: Text", "переведи: Текст"
-  const re =
-    /(?:переведи|переклади|translate)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?[\s:,\-]*([\s\S]*)$/i;
+  const re = /переведи(?:\s+на\s+([a-zA-ZА-Яа-яёіїєґ]+))?\s*[:\-,]?\s*(.*)$/is;
   const m = t.match(re);
   const lang = (m?.[1] || "").trim().toLowerCase() || null;
   const text = (m?.[2] || "").trim() || "";
@@ -135,6 +120,6 @@ export function honorific(lang = "ru", gender = "male") {
     case "pl": return isF ? "Pani" : "Panie";
     case "cz":
     case "cs": return isF ? "Paní" : "Pane";
-    case "en": default: return isF ? "Ma’am" : "Sir";
+    case "en": default: return isF ? "Ma'am" : "Sir";
   }
 }
