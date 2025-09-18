@@ -1,9 +1,6 @@
 // server.js — RenovoGo Bot v2 (modular: PG + Groq + Telegram + KB/Translate)
 // Node >= 18 (есть глобальный fetch)
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 0) ИМПОРТЫ И БАЗОВАЯ НАСТРОЙКА
-// ──────────────────────────────────────────────────────────────────────────────
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -11,8 +8,7 @@ import morgan from 'morgan';
 
 import { smartReply } from './src/reply.js';
 import { tgSend } from './src/telegram.js';
-import { upsertSession } from './src/db.js';
-import { pool } from './src/db.js';
+import { upsertSession, pool } from './src/db.js';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -34,12 +30,21 @@ if (!BOT_TOKEN) console.warn('⚠ BOT_TOKEN not set');
 // 1) HEALTH / DEBUG
 // ──────────────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('RenovoGo Bot is up'));
-app.get('/api/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.get('/api/ping', (req, res) => {
+  res.json({ ok: true, ts: Date.now(), env: {
+    has_DB: !!process.env.DATABASE_URL,
+    has_GROQ: !!process.env.GROQ_API_KEY,
+    has_BOT: !!BOT_TOKEN,
+    webhook: `/telegram/${WEBHOOK_SECRET}`
+  }});
+});
+
 app.get('/debug/webhook', (req, res) =>
   res.json({ ok: true, expected_path: `/telegram/${WEBHOOK_SECRET}` })
 );
+
 app.get('/debug/memory', async (req, res) => {
-  // Память хранится в Postgres — без RAM-слоёв
   res.json({ ok: true, note: 'Using Postgres for memory' });
 });
 
@@ -63,10 +68,7 @@ app.get('/api/export/:sessionKey', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 2) HTTP API ДЛЯ ВЕБ-ФРОНТА
- *  POST /api/reply { session_id, channel, text, lang }
- *  Возвращает: { ok, text }
- */
+// 2) HTTP API ДЛЯ ВЕБ-ФРОНТА
 // ──────────────────────────────────────────────────────────────────────────────
 app.post('/api/reply', async (req, res) => {
   const { session_id = 'web:local', channel = 'site', text = '', lang = 'ru' } = req.body || {};
@@ -82,10 +84,7 @@ app.post('/api/reply', async (req, res) => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 3) TELEGRAM WEBHOOK
- *  GET  /telegram/<WEBHOOK_SECRET> — быстрая проверка
- *  POST /telegram/<WEBHOOK_SECRET> — основной приём апдейтов
- */
+// 3) TELEGRAM WEBHOOK
 // ──────────────────────────────────────────────────────────────────────────────
 app.get(`/telegram/${WEBHOOK_SECRET}`, (req, res) => {
   res.json({ ok: true, via: 'GET', expected: `/telegram/${WEBHOOK_SECRET}` });
@@ -107,7 +106,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     const answer = await smartReply(`tg:${chatId}`, 'telegram', text, 'ru');
     await tgSend(chatId, answer);
 
-    // Важно: Всегда 200, иначе Telegram дублирует апдейты
+    // Telegram всегда ждёт 200, иначе будет слать дубликаты
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Telegram webhook error', e);
