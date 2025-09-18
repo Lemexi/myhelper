@@ -30,7 +30,7 @@ export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
   const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)[\s:,\-]*([\s\S]+)$/i;
   const m = t.match(re);
-  return m ? m[6].trim() : null;
+  return m ? m[2].trim() : null;
 }
 
 // === КОМАНДА "ПЕРЕВЕДИ" (рус/укр/англ + флаги) ===
