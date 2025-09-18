@@ -74,3 +74,14 @@ export async function logReply(sessionId, strategy, category, kbItemId, messageI
   `;
   await pool.query(q, [sessionId, strategy, category, kbItemId, messageId, notes]);
 }
+export async function getLastAuditCategory(sessionId) {
+  const q = `
+    SELECT category
+    FROM reply_audit
+    WHERE session_id=$1
+    ORDER BY id DESC
+    LIMIT 1
+  `;
+  const { rows } = await pool.query(q, [sessionId]);
+  return rows[0]?.category || null;
+}
