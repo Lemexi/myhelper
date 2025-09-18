@@ -17,21 +17,35 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-/* ───────────── LLM fallback ───────────── */
+/* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
-  const recent = await loadRecentMessages(sessionId, 24);
+  // Историю приводим к безопасному формату {role, content}
+  const recentRaw = await loadRecentMessages(sessionId, 24);
+  const recent = (recentRaw || [])
+    .map(m => ({ role: m.role, content: String(m.content ?? "") }))
+    .filter(m => m.role && m.content);
+
   const summary = await loadLatestSummary(sessionId);
-  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+
+  const messages = [];
+  messages.push({ role: "system", content: SYSTEM_PROMPT });
   if (summary) {
-    messages.push({ role: "system", content: `Краткая сводка прошлой истории:\n${summary}` });
+    messages.push({
+      role: "system",
+      content: `Краткая сводка прошлой истории:\n${summary}`
+    });
   }
   messages.push(...recent);
   messages.push({ role: "user", content: userTextEN });
-  const { text } = await runLLM(messages);
+
+  // Внутренняя страховка: удаляем любые посторонние поля
+  const safe = messages.map(m => ({ role: m.role, content: m.content }));
+
+  const { text } = await runLLM(safe);
   return text;
 }
 
-/* ───────────── Просьба имени ───────────── */
+/* ───────────────── Просьба имени ───────────────── */
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
   const by = {
@@ -44,9 +58,8 @@ function buildAskName(userLang, rawText) {
   return by[userLang] || by.en;
 }
 
-/* ───────────── Команды ───────────── */
+/* ───────────────── Команды ───────────────── */
 
-// Перевод (по умолчанию — на EN, с усилением стиля)
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord || "en").toLowerCase();
@@ -62,15 +75,15 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
-  const { targetLang: tgt, styled, styledRu } = await translateWithStyle({
-    sourceText: text, targetLang
-  });
+  const { targetLang: tgt, styled, styledRu } =
+    await translateWithStyle({ sourceText: text, targetLang });
 
   const combined =
-    `🔍 Перевод (${tgt.toUpperCase()}):\n` +
-    `${styled}\n\n` +
-    `💬 Для тебя (RU):\n` +
-    `${styledRu}`;
+`🔍 Перевод (${tgt.toUpperCase()}):
+${styled}
+
+💬 Для тебя (RU):
+${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(
@@ -78,10 +91,10 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     { category: "translate", strategy: "cmd_translate" },
     "en", userLang, combined, "translate"
   );
+
   return combined;
 }
 
-// «Я бы ответил…» — добавление в KB
 async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
@@ -94,7 +107,6 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
     );
     return msg;
   }
-
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
 
@@ -108,12 +120,13 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   return out;
 }
 
-// Быстрый ответ на «дорого»
 async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   const kb = (await kbFind("expensive", userLang)) || (await kbFind("expensive", "ru"));
   let answer;
   if (kb?.answer) {
-    answer = userLang !== "ru" ? (await translateCached(kb.answer, "ru", userLang)).text : kb.answer;
+    answer = userLang !== "ru"
+      ? (await translateCached(kb.answer, "ru", userLang)).text
+      : kb.answer;
   } else {
     answer = await replyCore(
       sessionId,
@@ -130,17 +143,17 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* ───────────── SmartReply ───────────── */
+/* ───────────────── SmartReply ───────────────── */
 
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канон EN + исходный язык
+  // Канонизируем вход
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  /* --- Команды: первыми --- */
+  // Команды (сырые — внутри парсеры сами чистят)
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -164,7 +177,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     }
-    // если пусто — игнорируем и идём дальше
   }
 
   if (isCmdAnswerExpensive(userTextRaw)) {
@@ -178,20 +190,18 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  /* --- Обновим контактные данные, если нашли --- */
+  // Имя / телефон
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
-  if (nameInThisMsg || phone) {
-    await updateContact(sessionId, { name: nameInThisMsg, phone });
-  }
+  if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  /* --- Сохраняем вход --- */
+  // Сохраняем вход пользователя
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
     null, "en", userLang, origText, null
   );
 
-  /* --- Если имени нет — вежливо спросим и завершим --- */
+  // Если имени нет — спросим
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -205,13 +215,11 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  /* --- Классификация → KB → LLM --- */
+  // Классификация → KB → LLM
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, userLang);
-  let answer;
-  let strategy = "fallback_llm";
-  let kbItemId = null;
+  let answer, strategy = "fallback_llm", kbItemId = null;
 
   if (kb) {
     answer = kb.answer;
@@ -232,7 +240,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     if (detectedLLM !== userLang) {
       answer = (await translateCached(answer, detectedLLM, userLang)).text;
     }
-    strategy = "fallback_llm";
   }
 
   const { canonical: ansEN } = await toEnglishCanonical(answer);
