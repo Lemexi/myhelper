@@ -1,5 +1,5 @@
 // server.js — RenovoGo backend (health, actions, chat, dedupe, classify, answer_on, restart)
-// v2025-09-18-4
+// v2025-09-18-6
 
 import 'dotenv/config';
 import express from 'express';
@@ -153,7 +153,7 @@ function truncateHistory(history = [], maxChars = MAX_CONTEXT_CHARS) {
   const arr = [...history];
   let total = arr.reduce((n, m) => n + (m.content?.length || 0), 0);
   while (total > maxChars && arr.length > 0) {
-    const i = arr.findIndex(m => m.role === 'user' || m.role === 'assistant');
+    const i = arr.findIndex(m => m.role === 'user' или m.role === 'assistant');
     arr.splice(i >= 0 ? i : 0, 1);
     total = arr.reduce((n, m) => n + (m.content?.length || 0), 0);
   }
@@ -203,19 +203,34 @@ function makeSystemPrompt({ language, session, examples }) {
   return lines.join('\n');
 }
 
+// СТРОГИЙ перевод без добавления новой информации
 function promptTranslate(tgt, src, text) {
-  return `Задача: сделай один законченный ответ на ${tgt.toUpperCase()} из текста на ${src.toUpperCase()}.
-Стиль: деловой и человечный WhatsApp, нейрокопирайтинг (ясность, выгоды, снятие рисков, микро-CTA), без воды.
-Формат: только итоговый текст на ${tgt.toUpperCase()} — без пояснений.
+  return `Переведи с ${src.toUpperCase()} на ${tgt.toUpperCase()} и слегка отполируй под деловую переписку WhatsApp.
+
+Правила строго:
+— НЕ добавляй новой информации, географии, сроков, цен, ограничений и вопросов, которых нет в оригинале.
+— Сохраняй смысл 1:1; допустима только естественная перефразировка на ${tgt.toUpperCase()}.
+— Тон: профессиональный, дружелюбный, уверенный. Без эмодзи и без служебных префиксов.
+— Объём: 1–3 коротких фразы. Верни только итоговый текст на ${tgt.toUpperCase()}.
+
 Текст:
 ${text}`;
 }
+
+function promptPolishTgt(tgtLang, text) {
+  return `Слегка отредактируй текст на ${tgtLang.toUpperCase()} для деловой переписки: яснее и естественнее.
+НИЧЕГО не добавляй по смыслу. Без эмодзи и без новых вопросов. Верни только итоговый текст.
+Текст:
+${text}`;
+}
+
 function promptRuEcho(tgtText, tgtLang) {
   return `Сделай аккуратную русскую версию текста (${tgtLang.toUpperCase()} → RU), не дословный бэктранслейт.
-Стиль деловой и лаконичный, без пояснений.
+Стиль деловой и лаконичный, без пояснений. Верни только текст.
 Текст:
 ${tgtText}`;
 }
+
 function promptRecompose(text, opts) {
   const { psychology = true, neurocopy = true, cta_micro = true } = opts || {};
   return `Пересобери текст в краткий, продающий ответ для B2B-переписки (WhatsApp/Telegram).
@@ -317,6 +332,7 @@ async function handleTranslate(body) {
   const model = pickModel(mode);
   const sys = makeSystemPrompt({ language: null, session, examples });
 
+  // строгий первичный перевод
   const msgs1 = [
     { role: 'system', content: sys },
     ...truncateHistory(messages),
@@ -324,6 +340,14 @@ async function handleTranslate(body) {
   ];
   const r1 = await runLLM({ model, messages: msgs1 });
   if (!r1.ok) return r1;
+
+  // лёгкий полишер без изменения смысла
+  const msgs1p = [
+    { role: 'system', content: sys },
+    { role: 'user', content: promptPolishTgt(tgt_lang, r1.text) }
+  ];
+  const r1p = await runLLM({ model, messages: msgs1p });
+  if (r1p.ok && r1p.text) r1.text = r1p.text;
 
   let ru_echo = null;
   if (need_ru_echo) {
@@ -475,7 +499,7 @@ app.get('/health', (_, res) => res.json({ ok: true, model: MODEL_PRIMARY }));
 app.get('/api/ping', (_, res) => res.json({ ok: true, ts: Date.now(), model: MODEL_PRIMARY }));
 
 app.post('/api/reply', async (req, res) => {
-  // анти-дубликаты по dedupe_key
+  // анти-дубликаты по dedupe_key (НЕ для обычного чата и answer_on — там мы его не шлём)
   const dedupeKey = req.body?.dedupe_key;
   if (isDuplicate(dedupeKey)) {
     return res.status(409).json({ ok: false, error: 'duplicate', dedupe_key: dedupeKey });
