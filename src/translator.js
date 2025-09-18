@@ -2,17 +2,38 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ── Маппинг слов → коды ── */
-const LangMap = {
-  "английский": "en", english: "en", eng: "en", en: "en",
-  "чешский": "cz", czech: "cz", cz: "cz", cs: "cz",
-  "польский": "pl", polish: "pl", pl: "pl",
-  "украинский": "uk", ukrainian: "uk", uk: "uk",
-  "русский": "ru", russian: "ru", ru: "ru",
+/* ── Маппинг слов/флагов → коды ── */
+const FlagMap = {
+  "🇬🇧": "en", "🇺🇸": "en", "🇨🇦": "en",
+  "🇵🇱": "pl",
+  "🇺🇦": "uk",
+  "🇷🇺": "ru",
+  "🇨🇿": "cz", "🇨🇭": "cz"
 };
+
+const LangMap = {
+  "английский": "en", "англ": "en", "на англ": "en",
+  english: "en", eng: "en", en: "en",
+
+  "чешский": "cz", "чеськ": "cz", "чеш": "cz", "на чеш": "cz",
+  czech: "cz", cz: "cz", cs: "cz",
+
+  "польский": "pl", "польск": "pl", "на пол": "pl",
+  polish: "pl", pl: "pl",
+
+  "украинский": "uk", "укр": "uk", "на укр": "uk", "українською": "uk",
+  ukrainian: "uk", uk: "uk",
+
+  "русский": "ru", "рус": "ru", "на рус": "ru", "російською": "ru",
+  russian: "ru", ru: "ru",
+};
+
 export function resolveTargetLangCode(word) {
   if (!word) return null;
-  const key = (word || "").toLowerCase();
+  const key = (word || "").toLowerCase().trim();
+  if (FlagMap[word]) return FlagMap[word];
+  const flag = [...word].find(ch => FlagMap[ch]);
+  if (flag) return FlagMap[flag];
   return LangMap[key] || null;
 }
 
@@ -89,9 +110,9 @@ export async function translateWithStyle({ sourceText, targetLang }) {
   ]);
 
   // Русские версии
-  const styledRu   = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
-  const altClean   = (altMaybe || "").trim();
-  const altStyled  = altClean ? altClean : "";
+  const styledRu    = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
+  const altClean    = (altMaybe || "").trim();
+  const altStyled   = altClean ? altClean : "";
   const altStyledRu = altStyled ? (target === "ru" ? altStyled : (await translateCached(altStyled, target, "ru")).text) : "";
 
   return { targetLang: target, styled, styledRu, altStyled, altStyledRu };
