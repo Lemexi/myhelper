@@ -1,4 +1,3 @@
-// /src/db.js
 import pg from "pg";
 const { Pool } = pg;
 
@@ -8,7 +7,7 @@ export const pool = new Pool({
   idleTimeoutMillis: 30000,
 });
 
-/* ─────────── sessions ─────────── */
+/* ───────────── sessions ───────────── */
 export async function upsertSession(sessionKey, channel) {
   const sel = "SELECT id FROM sessions WHERE session_key=$1 LIMIT 1";
   const { rows } = await pool.query(sel, [sessionKey]);
@@ -35,16 +34,9 @@ export async function getSession(sessionId) {
   return rows[0] || null;
 }
 
-/* ─────────── messages ─────────── */
+/* ───────────── messages ───────────── */
 export async function saveMessage(
-  sessionId,
-  role,
-  content,
-  meta=null,
-  lang=null,
-  translated_to=null,
-  translated_content=null,
-  category=null
+  sessionId, role, content, meta=null, lang=null, translated_to=null, translated_content=null, category=null
 ) {
   const q = `
     INSERT INTO messages (session_id, role, content, meta_json, lang, translated_to, translated_content, category)
@@ -52,56 +44,50 @@ export async function saveMessage(
     RETURNING id
   `;
   const { rows } = await pool.query(q, [
-    sessionId,
-    role,
-    content,
+    sessionId, role, content,
     meta ? JSON.stringify(meta) : null,
-    lang,
-    translated_to,
-    translated_content,
-    category
+    lang, translated_to, translated_content, category
   ]);
   return rows[0]?.id || null;
 }
 
 export async function loadRecentMessages(sessionId, limit=24) {
   const q = `
-    SELECT role, content
+    SELECT id, role, content, translated_content
     FROM messages
     WHERE session_id=$1
     ORDER BY id DESC
     LIMIT $2
   `;
   const { rows } = await pool.query(q, [sessionId, limit]);
-  return rows.reverse().map(r => ({ role: r.role, content: r.content }));
+  return rows.reverse().map(r => ({
+    id: r.id, role: r.role, content: r.content, translated_content: r.translated_content
+  }));
 }
 
-/* последние сообщения — НОВОЕ */
-export async function getLastUserMessage(sessionId) {
+/**
+ * Вернуть последнюю ПРЕДЫДУЩУЮ (до текущей команды) реплику пользователя.
+ * Удобно вызывать из handleCmdTeach сразу после сохранения «детекта команды».
+ */
+export async function getPreviousUserUtterance(sessionId) {
   const q = `
-    SELECT id, content, category
+    SELECT id, content, translated_content
     FROM messages
     WHERE session_id=$1 AND role='user'
     ORDER BY id DESC
-    LIMIT 1
+    LIMIT 2
   `;
   const { rows } = await pool.query(q, [sessionId]);
-  return rows[0] || null;
+  if (rows.length < 2) return { id: null, text: null };
+  const prev = rows[1];
+  // предпочитаем оригинал (translated_content), если он есть
+  const text = (prev.translated_content && prev.translated_content.trim())
+    ? prev.translated_content
+    : prev.content;
+  return { id: prev.id, text };
 }
 
-export async function getLastAssistantMessage(sessionId) {
-  const q = `
-    SELECT id, content, category
-    FROM messages
-    WHERE session_id=$1 AND role='assistant'
-    ORDER BY id DESC
-    LIMIT 1
-  `;
-  const { rows } = await pool.query(q, [sessionId]);
-  return rows[0] || null;
-}
-
-/* ─────────── summaries ─────────── */
+/* ───────────── summaries ───────────── */
 export async function loadLatestSummary(sessionId) {
   const q = "SELECT content FROM summaries WHERE session_id=$1 ORDER BY id DESC LIMIT 1";
   const { rows } = await pool.query(q, [sessionId]);
@@ -117,7 +103,7 @@ export async function saveSummary(sessionId, turnNo, content) {
   await pool.query(q, [sessionId, turnNo, content]);
 }
 
-/* ─────────── audit ─────────── */
+/* ───────────── audit ───────────── */
 export async function logReply(sessionId, strategy, category, kbItemId, messageId=null, notes=null) {
   const q = `
     INSERT INTO reply_audit (session_id, strategy, category, kb_item_id, message_id, notes)
