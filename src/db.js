@@ -80,11 +80,14 @@ export async function loadLatestSummary(sessionId) {
 }
 
 export async function logReply(sessionId, strategy, category, kbItemId, messageId=null, notes=null) {
+  // В некоторых БД есть CHECK на strategy — используем только «безопасные» значения.
+  const allowed = new Set(["kb_hit","kb_translated","fallback_llm","cmd"]);
+  const safeStrategy = allowed.has(strategy) ? strategy : "cmd";
   const q = `
     INSERT INTO reply_audit (session_id, strategy, category, kb_item_id, message_id, notes)
     VALUES ($1,$2,$3,$4,$5,$6)
   `;
-  await pool.query(q, [sessionId, strategy, category, kbItemId, messageId, notes]);
+  await pool.query(q, [sessionId, safeStrategy, category, kbItemId, messageId, notes]);
 }
 
 export async function getLastAuditCategory(sessionId) {
@@ -93,22 +96,67 @@ export async function getLastAuditCategory(sessionId) {
   return rows[0]?.category || null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Teach-cooldown helper: последний teach (время + текст)
-// ─────────────────────────────────────────────────────────────────────────────
-export async function getLastTeachInfo(sessionId) {
+// Последнее нормальное сообщение бота (не teach-подтверждение)
+export async function getLastAssistantMessage(sessionId) {
   const q = `
-    SELECT created_at, meta_json
+    SELECT id, content, translated_content, category, meta_json, created_at
     FROM messages
     WHERE session_id=$1
       AND role='assistant'
-      AND meta_json->>'strategy'='cmd_teach'
+      AND COALESCE(meta_json->>'strategy','') <> 'cmd_teach'
     ORDER BY id DESC
     LIMIT 1
   `;
   const { rows } = await pool.query(q, [sessionId]);
-  if (!rows.length) return null;
-  const row = rows[0];
-  const taught_text = row.meta_json?.taught_text || row.meta_json?.taught || null;
-  return { ts: new Date(row.created_at), taught_text };
+  return rows[0] || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Corrections (обучение «перепиши мой последний ответ»)
+// ─────────────────────────────────────────────────────────────────────────────
+async function ensureCorrectionsTable() {
+  const sql = `
+  CREATE TABLE IF NOT EXISTS corrections (
+    id bigserial PRIMARY KEY,
+    session_id bigint NOT NULL,
+    bot_message_id bigint NOT NULL,
+    category text,
+    prev_answer_en text NOT NULL,
+    taught_en text NOT NULL,
+    taught_local text,
+    taught_lang text,
+    created_at timestamptz DEFAULT now()
+  );
+  `;
+  await pool.query(sql);
+}
+
+export async function insertCorrection({
+  session_id, bot_message_id, category,
+  prev_answer_en, taught_en, taught_local, taught_lang
+}) {
+  await ensureCorrectionsTable();
+  const q = `
+    INSERT INTO corrections (session_id, bot_message_id, category, prev_answer_en, taught_en, taught_local, taught_lang)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    RETURNING id
+  `;
+  const { rows } = await pool.query(q, [
+    session_id, bot_message_id, category || null,
+    prev_answer_en, taught_en, taught_local || null, taught_lang || null
+  ]);
+  return rows[0]?.id || null;
+}
+
+export async function findCorrectionsByCategory(category, limit=20) {
+  await ensureCorrectionsTable();
+  const q = `
+    SELECT id, category, prev_answer_en, taught_en, taught_local, taught_lang
+    FROM corrections
+    WHERE ($1::text IS NULL AND category IS NULL) OR category=$1
+    ORDER BY id DESC
+    LIMIT $2
+  `;
+  const { rows } = await pool.query(q, [category || null, limit]);
+  return rows;
 }
