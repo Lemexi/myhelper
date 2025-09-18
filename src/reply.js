@@ -45,6 +45,7 @@ function buildAskName(userLang, rawText) {
 /* Команды */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
+  // Упрощение: если язык не указан, по умолчанию "en"
   const targetLang = (targetLangWord || "en").toLowerCase();
 
   if (!text || text.length < 2) {
@@ -56,15 +57,12 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
 
   const { targetLang: tgt, styled, styledRu } = await translateWithStyle({ sourceText: text, targetLang });
 
-  // Отдаём ДВА блока, всегда:
-  // 1) Целевая версия для клиента; 2) Для тебя (RU)
   const combined =
     `🔍 Перевод (${tgt.toUpperCase()}):\n` +
     `${styled}\n\n` +
     `💬 Для тебя (RU):\n` +
     `${styledRu}`;
 
-  // Сохраняем канонически в EN (в БД), оригинал комбинированного — в translated_content
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, combined, "translate");
 
@@ -109,28 +107,24 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } = await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // 0) Команды — строго ДО всего. Передаем userTextRaw напрямую
-  // функции isCmdTeach/isCmdTranslate сами делают stripQuoted + lower
+  // 0) Команды — строго ДО всего.
+  const cleanUserText = stripQuoted(userTextRaw);
 
-  if (isCmdTeach(userTextRaw)) {
+  if (isCmdTeach(cleanUserText)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
     const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
   }
 
-  if (isCmdTranslate(userTextRaw)) {
-    const { text: t } = parseCmdTranslate(userTextRaw);
-    if (t && t.length >= 2) {
-      const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
-      const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
-      await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
-      return out;
-    }
-    // если пусто — игнор и идём дальше
+  if (isCmdTranslate(cleanUserText)) {
+    const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
+    const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
+    await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
+    return out;
   }
 
-  if (isCmdAnswerExpensive(userTextRaw)) {
+  if (isCmdAnswerExpensive(cleanUserText)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "answer_expensive" }, "en", userLang, origText, null);
     const out = await handleCmdAnswerExpensive(sessionId, userLang);
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
