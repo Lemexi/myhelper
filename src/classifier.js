@@ -12,45 +12,37 @@ export function stripQuoted(raw = "") {
     const l = ln.trim();
     if (!l) continue;
     if (l.startsWith(">")) continue;                                   // цитаты
-    if (/^(assistant|bot)\b|renovogo\.com|^from:|^replying to/i.test(l)) continue; // шапки
+    if (/^assistant\b|renovogo\.com|^bot\b|^from:|^replying to/i.test(l)) continue; // шапки
     clean.push(l);
   }
   return clean.join("\n").trim();
 }
 
-/* ─────────── СЛЭШ-КОМАНДЫ ─────────── */
-export const isSlashTeach      = (t="") => /^\/teach\b/i.test(t.trim());
-export const isSlashTranslate  = (t="") => /^\/translate\b/i.test(t.trim());
-export const isSlashExpensive  = (t="") => /^\/expensive\b/i.test(t.trim());
-
-/* ─────────── ЕСТЕСТВЕННЫЕ КОМАНДЫ ─────────── */
-// «Ответил бы… / Я бы ответил(а)…» — в любом месте
+/* ─────────── Триггеры-команды ─────────── */
+// Принимаем любые формы: с/без двоеточия, в любом месте строки
 export function isCmdTeach(raw = "") {
-  const t = stripQuoted(raw).toLowerCase();
-  return /(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|\bответил[аи]?\s*бы\b)/.test(t);
+  const t = lower(stripQuoted(raw));
+  return /(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\b/.test(t);
 }
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  const m = t.match(/(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\s*[:,\-]?\s*(.+)$/is);
+  const m = t.match(/(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\s*[:\-,]?\s*(.+)$/is);
   return m ? m[2].trim() : null;
 }
 
-// «Переведи …» — только слово в начале строки (или /translate)
 export function isCmdTranslate(raw = "") {
-  const t = stripQuoted(raw);
-  return /(^|\n)\s*(переведи|translate)\b/i.test(t);
+  const t = lower(stripQuoted(raw));
+  return /\bпереведи(\s+на\s+[a-zA-ZА-Яа-яёіїєґ]+)?\b/.test(t);
 }
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  // варианты: "переведи en: текст", "переведи на чешский: текст", "translate pl текст"
-  const m =
-    t.match(/(^|\n)\s*(переведи|translate)\s*(?:на\s+([a-zA-ZА-Яа-яёіїєґ]+)|([a-z]{2}):?)?\s*[:,\-]?\s*(.+)$/is);
-  const langWord = (m?.[3] || m?.[4] || "").trim().toLowerCase() || null;
-  const text = (m?.[5] || "").trim();
-  return { targetLangWord: langWord, text };
+  const re = /переведи(?:\s+на\s+([a-zA-ZА-Яа-яёіїєґ]+))?\s*[:\-,]?\s*(.*)$/is;
+  const m = t.match(re);
+  const lang = (m?.[1] || "").trim().toLowerCase() || null;
+  const text = (m?.[2] || "").trim() || "";
+  return { targetLangWord: lang, text };
 }
 
-// «Ответь на дорого …»
 export function isCmdAnswerExpensive(raw = "") {
   const s = lower(stripQuoted(raw));
   return s.includes("ответь на дорого") || s.includes("агент говорит что дорого");
