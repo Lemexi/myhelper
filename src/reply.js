@@ -6,16 +6,20 @@ import {
   insertCorrection, findCorrectionsByCategory
 } from "./db.js";
 import { kbFind } from "./kb.js";
-import { translateCached, translateWithStyle, toEnglishCanonical, detectLanguage } from "./translator.js";
 import {
-  classifyCategory, detectAnyName, detectPhone, isCmdTeach, parseCmdTeach, isCmdTranslate, parseCmdTranslate,
-  isCmdAnswerExpensive, extractGreeting, stripQuoted, isSlashTeach, isSlashTranslate, isSlashExpensive
+  translateCached, translateWithStyle, toEnglishCanonical, detectLanguage
+} from "./translator.js";
+import {
+  classifyCategory, detectAnyName, detectPhone, isCmdTeach, parseCmdTeach,
+  isCmdTranslate, parseCmdTranslate, isCmdAnswerExpensive,
+  extractGreeting, stripQuoted,
+  isSlashTeach, isSlashTranslate, isSlashExpensive
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-/* helpers */
+/* util */
 function looksLikeShortAck(s=""){ const t=(s||"").trim(); if(t.length<=2) return true; if(t.length<=30 && !t.includes("?")) return true; return false; }
-function similar(a="",b=""){ const A=(a||"").trim().toLowerCase(); const B=(b||"").trim().toLowerCase(); if(!A||!B) return false; if(A===B) return true; const s=A.length<B.length?A:B; const l=A.length<B.length?B:A; return l.includes(s) && s.length>=Math.min(60,l.length*0.8); }
+function similar(a="",b=""){ const A=(a||"").trim().toLowerCase(); const B=(b||"").trim().toLowerCase(); if(!A||!B) return false; if(A===B) return true; const s=A.length<B.length?A:B; const l=A.length<B.length?B:A; return l.includes(s) && s.length>=Math.min(60, Math.floor(l.length*0.8)); }
 function buildAskName(userLang, raw){ const hi=extractGreeting(raw); const by={
   ru:`${hi?hi+". ":""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
   uk:`${hi?hi+". ":""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатись?`,
@@ -54,7 +58,7 @@ async function handleCmdTranslate(sessionId, raw, userLang="ru"){
   return parts;
 }
 
-// /teach и «Ответил бы…»: правим ПОСЛЕДНИЙ ответ бота, сохраняя ещё и триггер пользователя
+// /teach и «Ответил бы…»: обучаем ПОСЛЕДНИЙ ответ бота
 async function handleCmdTeach(sessionId, raw, userLang="ru"){
   const taughtLocal=parseCmdTeach(raw);
   if(!taughtLocal){
@@ -65,14 +69,13 @@ async function handleCmdTeach(sessionId, raw, userLang="ru"){
   }
   const pair=await getLastUserBotPair(sessionId);
   if(!pair){
-    const msg="Нет моего предыдущего ответа в этой сессии. Напиши вопрос — я отвечу, затем сможешь меня поправить.";
+    const msg="Нет моего предыдущего ответа в этой сессии. Сначала задайте вопрос — я отвечу, затем поправьте меня.";
     const { canonical }=await toEnglishCanonical(msg);
     await saveMessage(sessionId,"assistant",canonical,{category:"teach",strategy:"cmd"},"en",userLang,msg,"teach");
     return [msg];
   }
   const prev_cat = pair.bot_cat || (await getLastAuditCategory(sessionId)) || "general";
   const { canonical: taught_en }=await toEnglishCanonical(taughtLocal);
-  // сохраняем правку с триггером (предыдущее сообщение пользователя)
   const corrId=await insertCorrection({
     session_id: sessionId,
     bot_message_id: pair.bot_id,
@@ -81,14 +84,12 @@ async function handleCmdTeach(sessionId, raw, userLang="ru"){
     prev_answer_en: pair.bot_en || "",
     taught_en, taught_local: taughtLocal, taught_lang: userLang
   });
-  // сохраняем только чек в content
   const ok="✅ В базу добавлено.";
   const { canonical: okEN }=await toEnglishCanonical(ok);
   await saveMessage(sessionId,"assistant",okEN,
     {category:prev_cat,strategy:"cmd_teach",corr_id:corrId,prev_bot_msg_id:pair.bot_id,taught_text:taughtLocal,taught_en},
     "en",userLang,`${ok}\n\n${taughtLocal}`,prev_cat
   );
-  // выдаём чек и сам текст отдельными пузырями
   return [ok, taughtLocal];
 }
 
@@ -96,14 +97,14 @@ async function handleCmdAnswerExpensive(sessionId,userLang="ru"){
   const kb=(await kbFind("expensive",userLang))||(await kbFind("expensive","ru"));
   let answer;
   if(kb?.answer){ answer = userLang!=="ru" ? (await translateCached(kb.answer,"ru",userLang)).text : kb.answer; }
-  else { answer = await replyCore(sessionId, "Client says it's expensive. Short, firm, value-first, with CTA."); }
+  else { answer = await replyCore(sessionId, "Client says it's expensive. Short, value-first, firm, with CTA."); }
   const { canonical }=await toEnglishCanonical(answer);
   await saveMessage(sessionId,"assistant",canonical,{category:"expensive",strategy:"cmd"},"en",userLang,answer,"expensive");
   await logReply(sessionId,"cmd","expensive",kb?.id||null,null,"trigger: answer expensive");
   return [answer];
 }
 
-/* применение правок: нужно сходство и по триггеру пользователя, и по старому ответу */
+/* применяем правки: нужно сходство и по триггеру пользователя, и по старому ответу */
 async function applyCorrectionsIfAny({ category, draftAnswer, userLang, userTextEN }){
   const { canonical: draftEN }=await toEnglishCanonical(draftAnswer);
   const rows=await findCorrectionsByCategory(category,30);
@@ -111,7 +112,6 @@ async function applyCorrectionsIfAny({ category, draftAnswer, userLang, userText
     const triggerOk = c.trigger_user_en ? similar(userTextEN, c.trigger_user_en) : false;
     const answerOk  = similar(draftEN, c.prev_answer_en);
     if(triggerOk && answerOk){
-      // подстановка обученного текста
       if(c.taught_lang && c.taught_local){
         if(c.taught_lang===userLang) return c.taught_local;
         const { text }=await translateCached(c.taught_en,"en",userLang);
@@ -131,8 +131,8 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint=
   const userLang=srcLang||userLangHint;
   const cleaned=stripQuoted(userTextRaw);
 
-  // слэши
-  if(isSlashTeach(cleaned)) return await handleCmdTeach(sessionId, `Ответил бы ${cleaned.replace(/^\/teach\b\s*/i,"")}`, userLang);
+  // слеш-команды
+  if(isSlashTeach(cleaned))     return await handleCmdTeach(sessionId, `Ответил бы ${cleaned.replace(/^\/teach\b\s*/i,"")}`, userLang);
   if(isSlashTranslate(cleaned)) return await handleCmdTranslate(sessionId, cleaned.replace(/^\/translate\b\s*/i,"переведи "), userLang);
   if(isSlashExpensive(cleaned)) return await handleCmdAnswerExpensive(sessionId, userLang);
 
@@ -167,7 +167,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint=
   // сохраняем вход
   const userMsgId=await saveMessage(sessionId,"user",userTextEN,null,"en",userLang,origText,null);
 
-  // если имени нет — спросим
+  // если имени нет — спросим (вежливо + подстроенный привет)
   const session=await getSession(sessionId);
   const knownName=name||session?.user_name?.trim();
   if(!knownName){
@@ -192,7 +192,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint=
     if(lang!==userLang) answer=(await translateCached(answer,lang,userLang)).text;
   }
 
-  // Применяем правки: одновременно совпадает триггер (пользователь сейчас) и старый ответ
+  // Применяем обученные правки (если текущий вход похож на старый триггер)
   if(!looksLikeShortAck(userTextRaw)){
     answer=await applyCorrectionsIfAny({ category, draftAnswer:answer, userLang, userTextEN });
   }
