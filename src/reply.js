@@ -11,13 +11,13 @@ import {
 } from "./translator.js";
 import {
   classifyCategory, detectAnyName, detectPhone,
-  isCmdTeach, parseCmdTeach, isCmdTranslate, parseCmdTranslate,
-  isCmdAnswerExpensive, extractGreeting, stripQuoted,
-  isSlashTeach, isSlashTranslate, isSlashExpensive
+  isCmdTeach, parseCmdTeach,
+  isCmdTranslate, parseCmdTranslate,
+  isCmdAnswerExpensive, extractGreeting, stripQuoted
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-/* LLM fallback */
+/* ── LLM fallback ── */
 async function replyCore(sessionId, userTextEN) {
   const recent = await loadRecentMessages(sessionId, 24);
   const summary = await loadLatestSummary(sessionId);
@@ -29,7 +29,7 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* просьба имени */
+/* ── Просьба имени с зеркалингом приветствия ── */
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
   const by = {
@@ -42,13 +42,13 @@ function buildAskName(userLang, rawText) {
   return by[userLang] || by.en;
 }
 
-/* ----- обработчики команд ----- */
+/* ── Команды ── */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord || "en").toLowerCase();
 
   if (!text || text.length < 2) {
-    const msg = "Нужен текст после команды «Переведи» / /translate.";
+    const msg = "Нужен текст после команды «Переведи».";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate_error" }, "en", userLang, msg, "translate");
     return [msg];
@@ -57,12 +57,14 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLang: tgt, styled, styledRu, altStyled, altStyledRu } =
     await translateWithStyle({ sourceText: text, targetLang });
 
+  // Собираем массив сообщений: [основной целевой, основной RU, (опц) альтернатива целевая, (опц) альтернатива RU]
   const outMessages = [styled, styledRu];
   if (altStyled) {
     outMessages.push(altStyled);
     if (altStyledRu) outMessages.push(altStyledRu);
   }
 
+  // В БД сохраняем канон EN (склеим через \n\n для трекинга), но наружу отдаём массив
   const combinedForStore = outMessages.join("\n\n");
   const { canonical } = await toEnglishCanonical(combinedForStore);
   await saveMessage(
@@ -79,13 +81,15 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
 async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
-    const msg = "Нужен текст после «Ответил бы…» / /teach.";
+    const msg = "Нужен текст после «Ответил бы».";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(sessionId, "assistant", canonical, { category: "teach", strategy: "cmd_teach_error" }, "en", userLang, msg, "teach");
     return [msg];
   }
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
-  console.log("[TEACH] cat:", lastCat, "| len:", taught.length);
+
+  // лог в консоль + в meta
+  console.log("[TEACH] category:", lastCat, "| text:", taught.slice(0, 160));
 
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
   const out = `✅ В базу добавлено.\n\n${taught}`;
@@ -114,63 +118,50 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return [answer];
 }
 
-/* ----- SmartReply ----- */
+/* ── SmartReply ── */
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
+  // Канон EN + исходный язык
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } = await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  const cleaned = stripQuoted(userTextRaw);
+  // КОМАНДЫ — строго ДО всего (приоритет: teach → translate → expensive)
+  const cleanedForCmd = stripQuoted(userTextRaw);
 
-  // 0) СЛЭШ-КОМАНДЫ — приоритет абсолютный
-  if (isSlashTeach(cleaned)) {
-    const taught = cleaned.replace(/^\/teach\b\s*/i, "");
-    const out = await handleCmdTeach(sessionId, `Ответил бы ${taught}`, userLang);
-    return out;
-  }
-  if (isSlashTranslate(cleaned)) {
-    const payload = cleaned.replace(/^\/translate\b\s*/i, "переведи ");
-    const out = await handleCmdTranslate(sessionId, payload, userLang);
-    return out;
-  }
-  if (isSlashExpensive(cleaned)) {
-    const out = await handleCmdAnswerExpensive(sessionId, userLang);
-    return out;
-  }
-
-  // 1) ЕСТЕСТВЕННЫЕ КОМАНДЫ (teach → translate → expensive)
-  if (isCmdTeach(cleaned)) {
+  if (isCmdTeach(cleanedForCmd)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
-    const out = await handleCmdTeach(sessionId, cleaned, userLang);
+    const outs = await handleCmdTeach(sessionId, cleanedForCmd, userLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
-    return out;
+    return outs;
   }
-  if (isCmdTranslate(cleaned)) {
-    const { text: t } = parseCmdTranslate(cleaned);
+
+  if (isCmdTranslate(cleanedForCmd)) {
+    const { text: t } = parseCmdTranslate(cleanedForCmd);
     if (t && t.length >= 2) {
       const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
-      const out = await handleCmdTranslate(sessionId, cleaned, userLang);
+      const outs = await handleCmdTranslate(sessionId, cleanedForCmd, userLang);
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
-      return out;
+      return outs;
     }
   }
-  if (isCmdAnswerExpensive(cleaned)) {
+
+  if (isCmdAnswerExpensive(cleanedForCmd)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "answer_expensive" }, "en", userLang, origText, null);
-    const out = await handleCmdAnswerExpensive(sessionId, userLang);
+    const outs = await handleCmdAnswerExpensive(sessionId, userLang);
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
-    return out;
+    return outs;
   }
 
-  // 2) Имя/телефон
+  // Имя/телефон из текущего сообщения
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // 3) Сохраняем вход
+  // Сохраняем вход
   const userMsgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
 
-  // 4) Просьба имени при отсутствии
+  // Если имени нет — зеркалим приветствие и просим имя
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -180,7 +171,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return [ask];
   }
 
-  // 5) KB → перевод → LLM
+  // KB → перевод → LLM
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, userLang);
