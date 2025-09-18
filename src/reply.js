@@ -3,13 +3,11 @@ import { SYSTEM_PROMPT } from "./prompt.js";
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
   loadLatestSummary, logReply, getLastAuditCategory, getSession,
-  // QnA helpers:
   qnaFind, qnaTouchUse, getLastAssistantMessage, qnaInsert
 } from "./db.js";
 import { kbFind, kbInsertAnswer } from "./kb.js";
 import {
-  translateCached, translateWithStyle,
-  toEnglishCanonical, detectLanguage
+  translateCached, translateWithStyle, toEnglishCanonical, detectLanguage, resolveTargetLangCode
 } from "./translator.js";
 import {
   classifyCategory, detectAnyName, detectPhone,
@@ -37,18 +35,19 @@ function buildAskName(userLang, rawText) {
   const by = {
     ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
     uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатись?`,
-    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
+    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, как się zwracać?`,
     cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
     en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
   };
   return by[userLang] || by.en;
 }
 
-/* Команды */
+/* ── Перевод: чистый вывод + запись в QnA ── */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
-  // по умолчанию переводим на английский
-  const targetLang = (targetLangWord || "en").toLowerCase();
+  // если язык явно не указан — по умолчанию EN (твоё требование)
+  const guess = resolveTargetLangCode(targetLangWord || "") || "en";
+  const targetLang = (guess || "en").toLowerCase();
 
   if (!text || text.length < 2) {
     const msg = "Нужен текст после команды «Переведи».";
@@ -57,10 +56,10 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
-  // «умный» перевод с B2B-ритмом/влиянием
-  const { targetLang: tgt, styled, styledRu } = await translateWithStyle({ sourceText: text, targetLang });
+  // Усиленный B2B-стиль
+  const { targetLang: tgt, styled } = await translateWithStyle({ sourceText: text, targetLang });
 
-  // Сохраняем как QnA по исходной фразе (чтобы потом отдавать готовый стиль)
+  // Сохраняем в QnA по исходной фразе (канон EN ключа)
   const { canonical: qCanonEN } = await toEnglishCanonical(text);
   const qNormEN = norm((qCanonEN || "").toLowerCase());
   await qnaInsert({
@@ -72,20 +71,15 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     sessionId
   });
 
-  // Отдаём ДВА блока: целевой + русская подсказка
-  const combined =
-    `🔍 Перевод (${tgt.toUpperCase()}):\n` +
-    `${styled}\n\n` +
-    `💬 Для тебя (RU):\n` +
-    `${styledRu}`;
+  // Сохраняем ответ в лог (канон EN)
+  const { canonical } = await toEnglishCanonical(styled);
+  await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, styled, "translate");
 
-  // Сохраняем канонически EN (в БД), оригинал комбинированного — в translated_content
-  const { canonical } = await toEnglishCanonical(combined);
-  await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, combined, "translate");
-
-  return combined;
+  // Пользователю — сразу готовый текст без лейблов
+  return styled;
 }
 
+/* ── Обучение «Я бы ответил…»: привязка к последнему ассистентскому ── */
 async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
@@ -95,13 +89,13 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
-  // Привязываем к ПОСЛЕДНЕМУ сообщению ассистента
+  // Привязка к ПОСЛЕДНЕМУ сообщению ассистента
   const lastA = await getLastAssistantMessage(sessionId);
   const baseQuestion = lastA?.translated_content || lastA?.content || "";
   const { canonical: qCanonEN } = await toEnglishCanonical(baseQuestion || "");
   const qNormEN = norm((qCanonEN || "").toLowerCase());
 
-  // Пишем в QnA (приоритетная база для быстрых ответов)
+  // Вставка в QnA
   const qnaId = await qnaInsert({
     lang: userLang,
     questionNormEn: qNormEN,
@@ -111,17 +105,18 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
     sessionId
   });
 
-  // (опционально) дублируем в KB по последней категории
+  // (опционально) дублируем по последней категории
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
 
-  // Чёткий статус как просил: «✅ В базу внесено.»
+  // Чёткий статус
   const out = `✅ В базу внесено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId, qna_id: qnaId }, "en", userLang, out, lastCat);
   return out;
 }
 
+/* ── Возражение «дорого» ── */
 async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   const kb = (await kbFind("expensive", userLang)) || (await kbFind("expensive", "ru"));
   let answer;
@@ -136,15 +131,15 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* SmartReply */
+/* ── SmartReply ── */
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канон EN + исходный язык
+  // Канон EN + определяем язык пользователя
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } = await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // 0) Команды — строго ДО всего. Передаём СЫРОЙ userTextRaw
+  // 0) Команды — строго ДО всего (сырое сообщение)
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
     const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
@@ -160,7 +155,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     }
-    // если пусто — игнор и идём дальше
   }
 
   if (isCmdAnswerExpensive(userTextRaw)) {
@@ -170,7 +164,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // 1) Имя/телефон из текущего сообщения
+  // 1) Имя/телефон
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
@@ -178,7 +172,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   // 2) Сохраняем вход
   const userMsgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
 
-  // 3) Если имени нет — зеркалим приветствие и просим имя
+  // 3) Если имени нет — просим имя
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -188,7 +182,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // 4) QnA ПОВЕРХ ВСЕГО: если ранее учили точный ответ — отдать сразу
+  // 4) QnA поверх всего
   const qNormEN = norm((userTextEN || "").toLowerCase());
   const qnaHit = await qnaFind(userLang, qNormEN);
   if (qnaHit) {
@@ -200,7 +194,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return answer;
   }
 
-  // 5) Классификация → KB → перевод → LLM
+  // 5) KB → LLM
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, userLang);
