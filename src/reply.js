@@ -29,6 +29,19 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
+/* Просьба имени */
+function buildAskName(userLang, rawText) {
+  const hi = extractGreeting(rawText);
+  const by = {
+    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
+    uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатися?`,
+    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
+    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
+    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
+  };
+  return by[userLang] || by.en;
+}
+
 /* Команды */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
