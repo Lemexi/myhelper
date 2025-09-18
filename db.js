@@ -13,10 +13,12 @@ export async function upsertSession(sessionKey, channel) {
   const sel = 'SELECT id FROM sessions WHERE session_key=$1 LIMIT 1';
   const { rows } = await pool.query(sel, [sessionKey]);
   if (rows.length) return rows[0].id;
+
   const ins = 'INSERT INTO sessions (session_key, channel) VALUES ($1,$2) RETURNING id';
   const insRes = await pool.query(ins, [sessionKey, channel]);
   return insRes.rows[0].id;
 }
+
 export async function updateContact(sessionId, { name=null, phone=null, locale=null } = {}) {
   const parts = []; const vals = []; let i = 1;
   if (name)  { parts.push(`user_name=$${i++}`);  vals.push(name); }
@@ -42,6 +44,7 @@ export async function saveMessage(sessionId, role, content, meta=null, lang=null
   ]);
   return rows[0]?.id || null;
 }
+
 export async function loadRecentMessages(sessionId, limit=24) {
   const q = 'SELECT role, content FROM messages WHERE session_id=$1 ORDER BY id DESC LIMIT $2';
   const { rows } = await pool.query(q, [sessionId, limit]);
