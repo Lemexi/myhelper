@@ -2,9 +2,7 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ─────────────────────────────────────────
-   Языковые коды и маппинг слов → кодов
-────────────────────────────────────────── */
+/* ── Маппинг слов → коды ── */
 const LangMap = {
   "английский": "en", english: "en", eng: "en", en: "en",
   "чешский": "cz", czech: "cz", cz: "cz", cs: "cz",
@@ -18,9 +16,7 @@ export function resolveTargetLangCode(word) {
   return LangMap[key] || null;
 }
 
-/* ─────────────────────────────────────────
-   Определение языка (через LLM)
-────────────────────────────────────────── */
+/* ── Детект языка ── */
 export async function detectLanguage(text) {
   const { text: out } = await runLLM([
     { role: "system", content: "Detect language code (en,ru,uk,pl,cz). Output only the code." },
@@ -30,9 +26,7 @@ export async function detectLanguage(text) {
   return ["en","ru","uk","pl","cz"].includes(code) ? code : "en";
 }
 
-/* ─────────────────────────────────────────
-   Кэш перевода (любой → любой)
-────────────────────────────────────────── */
+/* ── Кэш перевода ── */
 export async function translateCached(text, sourceLang, targetLang) {
   if (!text || sourceLang === targetLang) return { text, cached: true };
 
@@ -59,9 +53,7 @@ export async function translateCached(text, sourceLang, targetLang) {
   return { text: translated, cached: false };
 }
 
-/* ─────────────────────────────────────────
-   Канонизация: всё в EN
-────────────────────────────────────────── */
+/* ── Канонизация: всё в EN ── */
 export async function toEnglishCanonical(text) {
   const src = await detectLanguage(text);
   if (src === "en") return { canonical: text, sourceLang: "en", original: text };
@@ -69,20 +61,24 @@ export async function toEnglishCanonical(text) {
   return { canonical, sourceLang: src, original: text };
 }
 
-/* ─────────────────────────────────────────
-   Перевод с «усилением» для клиента + RU для менеджера
-────────────────────────────────────────── */
+/* ── Перевод с «усилением»: целевой + RU для менеджера ── */
 export async function translateWithStyle({ sourceText, targetLang }) {
   const target = targetLang || "en";
+
+  // 1) Перепишем текст под WhatsApp B2B в целевом языке
   const { text: styled } = await runLLM([
-    { role: "system", content: "Rewrite the text for B2B WhatsApp: brief (1–4 sentences), confident, helpful, persuasive but ethical. Use soft Cialdini principles (1–2 max). Output only the rewritten text in the target language." },
+    { role: "system", content: "Rewrite for B2B WhatsApp: brief (1–4 sentences), confident, helpful, persuasive but ethical. Use at most 1–2 soft Cialdini principles. Output only the rewritten text in the target language." },
     { role: "user", content: `Target language: ${target}. Text:\n${sourceText}` }
   ]);
 
-  const { text: styledRu } = await runLLM([
-    { role: "system", content: "Translate preserving meaning and tone." },
-    { role: "user", content: `Translate to ru: ${styled}` }
-  ]);
+  // 2) Версия для менеджера на русском (перевод из целевого языка)
+  let styledRu;
+  if (target === "ru") {
+    styledRu = styled;
+  } else {
+    const { text: ru } = await translateCached(styled, target, "ru");
+    styledRu = ru;
+  }
 
   return { targetLang: target, styled, styledRu };
 }
