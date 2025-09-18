@@ -25,33 +25,34 @@ export function stripQuoted(raw = "") {
 
 /* ─────────── Триггеры-команды ─────────── */
 
-// «Я бы ответил/а …» — ловим варианты порядка слов и женскую форму
+// «Я бы ответил/а …» — ловим варианты порядка слов и женскую форму. Упрощено.
 export function isCmdTeach(raw = "") {
-  const t = lower(stripQuoted(raw));
-  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)(?=\s|:|,|-|$)/i.test(t);
+  const t = lower(raw);
+  // Упрощённое регулярное выражение
+  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)\b/.test(t);
 }
+
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)[\s:,\-]*([\s\S]+)$/i;
+  // Упрощённое регулярное выражение
+  const re = /(?:я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)\s*([\s\S]+)$/i;
   const m = t.match(re);
-  // группы: [0]=вся строка, [1]=триггер, [2]/[3]/[4]/[5] — подгруппы (не важны), [6]=текст ответа
-  // но проще и безопаснее взять последнюю группу через .pop():
   if (!m) return null;
   const groups = Array.from(m);
   const last = groups.pop();
   return (last || "").trim() || null;
 }
 
-// Перевод: поддержим «переведи», «переклади», «translate (to)», флагами займёмся в translator.js
+// Перевод: поддержим «переведи», «переклади», «translate (to)»
 export function isCmdTranslate(raw = "") {
-  const t = lower(stripQuoted(raw));
+  const t = lower(raw);
   return /\b(переведи|переклади|translate)\b/.test(t);
 }
+
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  // варианты: "переведи на англ: Текст", "переклади на польську Текст", "translate to en: Text", "переведи: Текст"
-  const re =
-    /(?:переведи|переклади|translate)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?[\s:,\-]*([\s\S]*)$/i;
+  // Обновлённое рег. выражение, чтобы поймать текст после команды даже без знаков препинания
+  const re = /(?:переведи|переклади|translate)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?\s*([\s\S]*)$/i;
   const m = t.match(re);
   const lang = (m?.[1] || "").trim().toLowerCase() || null;
   const text = (m?.[2] || "").trim() || "";
@@ -59,7 +60,7 @@ export function parseCmdTranslate(raw = "") {
 }
 
 export function isCmdAnswerExpensive(raw = "") {
-  const s = lower(stripQuoted(raw));
+  const s = lower(raw);
   return s.includes("ответь на дорого") || s.includes("агент говорит что дорого");
 }
 export function isCmdAnswerGeneric(raw = "") {
