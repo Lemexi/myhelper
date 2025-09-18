@@ -1,85 +1,102 @@
 // /src/classifier.js
 
-// Нормализация и чистка цитат/префиксов
+/* ─────────── НОРМАЛИЗАЦИЯ ─────────── */
 export function norm(s = "") {
-  return (s || "").replace(/\s+/g, " ").replace(/[«»“”"'\u00A0]/g, '"').trim();
+  return (s || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[«»“”]/g, '"')
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 export function lower(s = "") { return norm(s).toLowerCase(); }
+
+/* Телеграм присылает реплай с префиксами строк — вычистим «цитату» */
 export function stripQuoted(raw = "") {
-  const lines = (raw || "").split(/\r?\n/);
+  if (!raw) return "";
+  const lines = String(raw).split(/\r?\n/);
   const clean = [];
   for (const ln of lines) {
     const l = ln.trim();
     if (!l) continue;
-    if (l.startsWith(">")) continue;                                   // цитаты
-    if (/^assistant\b|renovogo\.com|^bot\b|^from:|^replying to/i.test(l)) continue; // шапки
+    // 1) Прямая цитата > ...
+    if (/^>/.test(l)) continue;
+    // 2) Шапки reply-предпросмотра
+    if (/^(from:|replying to)/i.test(l)) continue;
+    if (/^assistant\b/i.test(l)) continue;
+    if (/renovogo\.com/i.test(l)) continue;
+    // 3) «прикреплённое» превью (часто заканчивается «…»)
+    if (/^https?:\/\//i.test(l)) continue;
     clean.push(l);
   }
   return clean.join("\n").trim();
 }
 
-/* ─────────── Триггеры-команды ─────────── */
+/* ─────────── КОМАНДЫ ─────────── */
 
-// === КОМАНДА "Я БЫ ОТВЕТИЛ/А" ===
-// Принимаем любые формы: порядок слов, женскую форму, и без "бы"
+/** «Я бы ответил/а …» — ловим любые варианты + "так:" */
 export function isCmdTeach(raw = "") {
   const t = lower(stripQuoted(raw));
-  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)(?=\s|:|,|-|$)/i.test(t);
+  // не требуем точных границ слова — разрешаем двоеточие/дефис/эмодзи сразу после
+  return /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)(?=[\s:,\-]|$)/i.test(t);
 }
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)[\s:,\-]*([\s\S]+)$/i;
+  // захватываем всё после маркера, включая "так:" (оно просто окажется в тексте)
+  const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|я\s*ответил(а)?|ответил(а)?\s*бы)[\s:,\-]*([\s\S]+)$/i;
   const m = t.match(re);
-  return m ? m[2].trim() : null;
+  return m ? m[5].trim() : null;
 }
 
-// === КОМАНДА "ПЕРЕВЕДИ" (рус/укр/англ + флаги) ===
-const LANG_TOKENS = [
-  "переведи", "переклади", "translate", "translation", "tl"
-];
-// пара «региональных» флагов (эмодзи) — базовый признак наличия флага
-const FLAG_PAIR_RE = /([\u{1F1E6}-\u{1F1FF}]{2})/u;
+/** Список «токенов перевода» */
+const LANG_TOKENS = ["переведи","переклади","translate","translation","tl"];
 
+/** «Переведи …» — допускаем двоеточие, «на язык», флаги, и просто флаг + текст */
 export function isCmdTranslate(raw = "") {
-  const body = stripQuoted(raw);
-  const t = lower(body);
-  const hasKeyword = LANG_TOKENS.some(k => t.startsWith(k) || t.includes(` ${k} `));
-  const hasFlag = FLAG_PAIR_RE.test(body);
-  return hasKeyword || hasFlag;
+  const hasFlag = /([\u{1F1E6}-\u{1F1FF}]{2})/u.test(raw); // эмодзи-флаги
+  const t = lower(stripQuoted(raw));
+  const hasToken = LANG_TOKENS.some(k => t.startsWith(k) || t.includes(` ${k} `));
+  return hasFlag || hasToken;
 }
 
+/** Разбор перевода: возвращаем { targetLangWord, text } */
 export function parseCmdTranslate(raw = "") {
-  const t = stripQuoted(raw);
+  const original = stripQuoted(raw);
 
-  // 1) Язык по флагу (если есть — берём первый)
-  const flagMatch = t.match(FLAG_PAIR_RE);
+  // 1) Если есть флаг — возьмём первый
+  const flagMatch = original.match(/([\u{1F1E6}-\u{1F1FF}]{2})/u);
   const flag = flagMatch ? flagMatch[1] : null;
 
-  // 2) "переведи/переклади/translate (to) на <язык>: <текст>"
+  // 2) Паттерн с «переведи/переклади/translate [на|to] <язык> : <текст>»
   const re =
-    /(?:переведи|переклади|translate(?:\s+to)?)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?[\s:,\-]*([\s\S]*)$/i;
-  const m = t.match(re);
+    /(?:переведи|переклади|translate(?:\s+to)?)\s*(?:на|to)?\s*([A-Za-zА-Яа-яЁёЇїІіЄєҐґ\. ]{0,30})[\s:,\-]*([\s\S]*)$/i;
+  const m = original.match(re);
   const langWord = (m?.[1] || "").trim();
-  let text = (m?.[2] || "").trim();
+  let textPart = (m?.[2] || "").trim();
 
-  // 3) Фолбэк: если была конструкция "🇬🇧 <текст>" без ключевого слова
+  // 3) Если токена нет, а есть флаг — формат «🇬🇧 Текст…»
   if (!m && flag) {
-    text = t.replace(flag, "").trim();
+    textPart = norm(original.replace(flag, ""));
   }
 
-  const targetLangWord = flag ? flag : (langWord || null);
-  return { targetLangWord, text };
+  // 4) Итоговый язык-слово: флаг приоритетнее
+  const targetLangWord = (flag || langWord || "").trim() || null;
+
+  return { targetLangWord, text: textPart };
 }
 
-export function isCmdAnswerExpensive(raw = "") {
-  const s = lower(stripQuoted(raw));
-  return s.includes("ответь на дорого") || s.includes("агент говорит что дорого");
+/* ─────────── КЛАССИФИКАЦИЯ (fallback-правила) ─────────── */
+export async function classifyCategoryRuleBased(text = "") {
+  const t = lower(text);
+  if (t.includes("дорог") || t.includes("price")) return "expensive";
+  if (t.includes("после виз") || t.includes("after visa")) return "after_visa";
+  if (t.includes("контракт") || t.includes("agreement")) return "contract";
+  if (t.includes("деманд") || t.includes("vacanc")) return "demands";
+  return "general";
 }
-export function isCmdAnswerGeneric(raw = "") {
-  return /^ответь\s+на\s+/i.test(stripQuoted(raw));
-}
+export const classifyCategory = classifyCategoryRuleBased;
 
-/* ─────────── Приветствия ─────────── */
+/* ─────────── ПРИВЕТСТВИЯ ─────────── */
 const greetMap = [
   { re: /добрый\s*д(е|ё)нь/i, ru: "Добрый день" },
   { re: /добрый\s*вечер/i,   ru: "Добрый вечер" },
@@ -93,21 +110,10 @@ export function extractGreeting(raw = "") {
   return hit ? hit.ru : null;
 }
 
-/* ─────────── Классификатор (фолбэк) ─────────── */
-export async function classifyCategoryRuleBased(text = "") {
-  const t = lower(text);
-  if (t.includes("дорог") || t.includes("price")) return "expensive";
-  if (t.includes("после виз") || t.includes("after visa")) return "after_visa";
-  if (t.includes("контракт") || t.includes("agreement")) return "contract";
-  if (t.includes("деманд") || t.includes("vacanc")) return "demands";
-  return "general";
-}
-export const classifyCategory = classifyCategoryRuleBased;
-
-/* ─────────── Имя / телефон ─────────── */
+/* ─────────── ИМЯ/ТЕЛЕФОН ─────────── */
 export function detectNameSentence(text) {
   const m = text?.match(
-    /\b(меня зовут|i am|my name is|мене звати|mam na imię|jmenuji se)\s+([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][\p{L}\-']{1,}\s*[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠŠČŘÝÁÍÉÜÖÄ\p{L}\-']*)/iu
+    /\b(меня зовут|i am|my name is|мене звати|mam na imię|jmenuji se)\s+([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][\p{L}\-']{1,}\s*[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ\p{L}\-']*)/iu
   );
   return m ? m[2].trim() : null;
 }
@@ -130,7 +136,7 @@ export function detectPhone(text) {
   return m ? m[0].replace(/[^\d+]/g, "") : null;
 }
 
-/* ─────────── Пол + обращение ─────────── */
+/* ─────────── ПОЛ + ОБРАЩЕНИЕ ─────────── */
 const FEMALE_ENDINGS = ["а","я","ia","iia","na","ta","ra","la","sha","scha","ska","eva","ina","yna","ena","onna","anna","alla","ella","maria","olga","irina","natalia","natalya","oksana","tatiana","tetiana","svetlana","svitlana","alena","sofia","zofia","ewa","agnieszka","kasia","katarzyna","aleksandra","veronika","veronica"];
 export function guessGenderByName(nameRaw = "") {
   const first = lower(nameRaw).split(" ")[0];
