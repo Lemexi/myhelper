@@ -120,21 +120,22 @@ export const classifyCategory = classifyCategoryRuleBased;
 
 /* ─────────── Имя / телефон ─────────── */
 export function detectNameSentence(text) {
+  // Упрощенное регулярное выражение без проблемных символов
   const m = text?.match(
-    /\b(меня зовут|i am|my name is|мене звати|mam na imię|jmenuji se)\s+([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][\p{L}-']{1,}\s*[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ\p{L}-']*)/iu
+    /\b(меня зовут|i am|my name is|мене звати|mam na imie|jmenuji se)\s+([A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,}\s*[A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']*)/i
   );
   return m ? m[2].trim() : null;
 }
 
 export function detectStandaloneName(text) {
   const t = norm(text);
-  if (/^[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ]{1,29}$/.test(t)) return t;
+  if (/^[A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,29}$/i.test(t)) return t;
   return null;
 }
 
 export function detectLeadingName(text) {
   const m = norm(text).match(
-    /^([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][A-Za-zА-Яа-яЁёЇїІіЄєҐґŁłŚśŻżŹźĆćŃńÓóĎďŠšČčŘřÝýÁáÍíÉéÜüÖöÄä-']{1,29})\s*[,—-]/u
+    /^([A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,29})\s*[,—-]/i
   );
   return m ? m[1].trim() : null;
 }
@@ -144,7 +145,7 @@ export function detectAnyName(text) {
 }
 
 export function detectPhone(text) {
-  const m = text?.match(/\+?[0-9][0-9 -()]{6,}/);
+  const m = text?.match(/\+?[0-9][0-9 \-()]{6,}/);
   return m ? m[0].replace(/[^\d+]/g, "") : null;
 }
 
