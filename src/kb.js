@@ -1,7 +1,6 @@
 // /src/kb.js
-import { pool } from './db.js';
+import { pool } from "./db.js";
 
-// Найти первый активный ответ по категории и языку
 export async function kbFind(categorySlug, lang) {
   const q = `
     SELECT ki.id, ki.answer
@@ -15,7 +14,6 @@ export async function kbFind(categorySlug, lang) {
   return rows[0] || null;
 }
 
-// Создать (или найти) категорию по slug
 export async function kbEnsureCategory(slug, title = null) {
   const sel = `SELECT id FROM kb_categories WHERE slug=$1 LIMIT 1`;
   const r1 = await pool.query(sel, [slug]);
@@ -26,7 +24,6 @@ export async function kbEnsureCategory(slug, title = null) {
   return r2.rows[0].id;
 }
 
-// Добавить вариант ответа в kb_items
 export async function kbInsertAnswer(slug, lang, answer, isActive = true) {
   const catId = await kbEnsureCategory(slug);
   const q = `
