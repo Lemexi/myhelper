@@ -2,38 +2,28 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ── Маппинг слов/флагов → коды ── */
+/* ── Маппинг флагов и слов → коды ── */
 const FlagMap = {
-  "🇬🇧": "en", "🇺🇸": "en", "🇨🇦": "en",
-  "🇵🇱": "pl",
-  "🇺🇦": "uk",
-  "🇷🇺": "ru",
-  "🇨🇿": "cz", "🇨🇭": "cz"
+  "🇬🇧":"en","🇺🇸":"en","🇨🇦":"en",
+  "🇵🇱":"pl",
+  "🇺🇦":"uk",
+  "🇷🇺":"ru",
+  "🇨🇿":"cz","🇨🇭":"cz" // упрощённо
 };
-
 const LangMap = {
-  "английский": "en", "англ": "en", "на англ": "en",
-  english: "en", eng: "en", en: "en",
-
-  "чешский": "cz", "чеськ": "cz", "чеш": "cz", "на чеш": "cz",
-  czech: "cz", cz: "cz", cs: "cz",
-
-  "польский": "pl", "польск": "pl", "на пол": "pl",
-  polish: "pl", pl: "pl",
-
-  "украинский": "uk", "укр": "uk", "на укр": "uk", "українською": "uk",
-  ukrainian: "uk", uk: "uk",
-
-  "русский": "ru", "рус": "ru", "на рус": "ru", "російською": "ru",
-  russian: "ru", ru: "ru",
+  "английский":"en","англ":"en","на англ":"en", english:"en", eng:"en", en:"en",
+  "чешский":"cz","чеськ":"cz","на чеш":"cz","чеш":"cz", czech:"cz", cz:"cz", cs:"cz",
+  "польский":"pl","польск":"pl","на пол":"pl", polish:"pl", pl:"pl",
+  "украинский":"uk","українською":"uk","на укр":"uk","укр":"uk", ukrainian:"uk", uk:"uk",
+  "русский":"ru","російською":"ru","на рус":"ru","рус":"ru", russian:"ru", ru:"ru",
 };
-
 export function resolveTargetLangCode(word) {
   if (!word) return null;
+  // если в слове есть эмодзи-флаг — берём его
+  for (const ch of [...word]) {
+    if (FlagMap[ch]) return FlagMap[ch];
+  }
   const key = (word || "").toLowerCase().trim();
-  if (FlagMap[word]) return FlagMap[word];
-  const flag = [...word].find(ch => FlagMap[ch]);
-  if (flag) return FlagMap[flag];
   return LangMap[key] || null;
 }
 
@@ -41,7 +31,7 @@ export function resolveTargetLangCode(word) {
 export async function detectLanguage(text) {
   const { text: out } = await runLLM([
     { role: "system", content: "Detect language code among: en,ru,uk,pl,cz. Output only the code." },
-    { role: "user", content: text.slice(0, 500) }
+    { role: "user", content: String(text || "").slice(0, 500) }
   ], { max_tokens: 5 });
   const code = (out || "en").trim().toLowerCase();
   return ["en","ru","uk","pl","cz"].includes(code) ? code : "en";
@@ -50,7 +40,6 @@ export async function detectLanguage(text) {
 /* ── Кэш перевода ── */
 export async function translateCached(text, sourceLang, targetLang) {
   if (!text || sourceLang === targetLang) return { text, cached: true };
-
   const sel = `
     SELECT translated_text
     FROM translations_cache
@@ -74,17 +63,17 @@ export async function translateCached(text, sourceLang, targetLang) {
   return { text: translated, cached: false };
 }
 
-/* ── Канонизация: всё в EN ── */
+/* ── Канонизация в EN ── */
 export async function toEnglishCanonical(text) {
   const src = await detectLanguage(text);
-  if (src === "en") return { canonical: text, sourceLang: "en", original: text };
-  const { text: canonical } = await translateCached(text, src, "en");
-  return { canonical, sourceLang: src, original: text };
+  if (src === "en") return { canonical: String(text || ""), sourceLang: "en", original: String(text || "") };
+  const { text: canonical } = await translateCached(String(text || ""), src, "en");
+  return { canonical, sourceLang: src, original: String(text || "") };
 }
 
-/* ── Перевод с «усилением»: целевой + RU; опциональная альтернатива ── */
+/* ── Перевод c «маркетинговым стилем» (для ботового ответа) ── */
 export async function translateWithStyle({ sourceText, targetLang }) {
-  const target = (targetLang || "en").toLowerCase();
+  const target = (resolveTargetLangCode(targetLang) || targetLang || "en").toLowerCase();
 
   // Основной вариант (строго без пояснений)
   const { text: styled } = await runLLM([
@@ -97,7 +86,7 @@ export async function translateWithStyle({ sourceText, targetLang }) {
     { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // Альтернативный вариант (может вернуть пустую строку — тогда его нет)
+  // Альтернатива (может вернуть пусто)
   const { text: altMaybe } = await runLLM([
     {
       role: "system",
@@ -109,10 +98,10 @@ export async function translateWithStyle({ sourceText, targetLang }) {
     { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // Русские версии
-  const styledRu    = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
-  const altClean    = (altMaybe || "").trim();
-  const altStyled   = altClean ? altClean : "";
+  // Русские версии для владельца
+  const styledRu   = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
+  const altClean   = (altMaybe || "").trim();
+  const altStyled  = altClean ? altClean : "";
   const altStyledRu = altStyled ? (target === "ru" ? altStyled : (await translateCached(altStyled, target, "ru")).text) : "";
 
   return { targetLang: target, styled, styledRu, altStyled, altStyledRu };
