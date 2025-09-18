@@ -6,7 +6,8 @@ export async function translateCached(text, sourceLang, targetLang) {
   if (!text || sourceLang === targetLang) return { text, cached: true };
 
   const sel = `
-    SELECT translated_text FROM translations_cache
+    SELECT translated_text
+    FROM translations_cache
     WHERE source_lang=$1 AND target_lang=$2 AND md5(source_text)=md5($3)
     LIMIT 1
   `;
@@ -20,7 +21,8 @@ export async function translateCached(text, sourceLang, targetLang) {
 
   const ins = `
     INSERT INTO translations_cache (source_text, source_lang, target_lang, translated_text, by_model)
-    VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING
+    VALUES ($1,$2,$3,$4,$5)
+    ON CONFLICT DO NOTHING
   `;
   await pool.query(ins, [text, sourceLang, targetLang, translated, 'groq']);
   return { text: translated, cached: false };
