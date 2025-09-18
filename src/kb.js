@@ -14,19 +14,19 @@ import { pool } from "./db.js";
  */
 export async function kbFind(categorySlug, lang, question = null) {
   // 1) сначала пытаемся найти по совпадению вопроса
-  const withQuestionSql = `
-    SELECT ki.id, ki.answer, ki.question
-    FROM kb_items ki
-    JOIN kb_categories kc ON kc.id = ki.category_id
-    WHERE kc.slug = $1
-      AND ki.lang = $2
-      AND ki.is_active = TRUE
-      AND ki.question IS NOT NULL
-      AND ($3 IS NOT NULL AND ki.question ILIKE '%' || $3 || '%')
-    ORDER BY random()
-    LIMIT 1
-  `;
   if (question && question.trim().length > 0) {
+    const withQuestionSql = `
+      SELECT ki.id, ki.answer, ki.question
+      FROM kb_items ki
+      JOIN kb_categories kc ON kc.id = ki.category_id
+      WHERE kc.slug = $1
+        AND ki.lang = $2
+        AND ki.is_active = TRUE
+        AND ki.question IS NOT NULL
+        AND ki.question ILIKE '%' || $3 || '%'
+      ORDER BY random()
+      LIMIT 1
+    `;
     const r1 = await pool.query(withQuestionSql, [categorySlug, lang, question]);
     if (r1.rows.length) return r1.rows[0];
   }
