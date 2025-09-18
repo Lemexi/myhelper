@@ -1,4 +1,3 @@
-// /src/reply.js
 import { SYSTEM_PROMPT } from "./prompt.js";
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
@@ -58,9 +57,9 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   if (!text || text.length < 2) {
     let msg;
     if (userLang === "ru") {
-      msg = "Нужен текст после команды «Переведи». Например: ‘Переведи привет’ или ‘Переведи на английский привет’.";
+      msg = "Нужен текст после команды «Переведи». Например: 'Переведи привет' или 'Переведи на английский привет'.";
     } else {
-      msg = "Text needed after the ‘Translate’ command. Example: ‘Translate hello’ or ‘Translate to Russian hello’.";
+      msg = "Text needed after the 'Translate' command. Example: 'Translate hello' or 'Translate to Russian hello'.";
     }
 
     const { canonical } = await toEnglishCanonical(msg);
@@ -108,9 +107,9 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   if (!taught) {
     let msg;
     if (userLang === "ru") {
-      msg = "Нужен текст после команды. Например: ‘Я бы ответил: Спасибо за вопрос!’";
+      msg = "Нужен текст после команды. Например: 'Я бы ответил: Спасибо за вопрос!' или 'Ответил бы: Это хорошее предложение'";
     } else {
-      msg = "Text needed after the command. Example: ‘I would answer: Thank you for the question!’";
+      msg = "Text needed after the command. Example: 'I would answer: Thank you for the question!' or 'Would answer: This is a good offer'";
     }
 
     const { canonical } = await toEnglishCanonical(msg);
@@ -132,8 +131,8 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
 
   const out =
     userLang === "ru"
-      ? `✅ В базу добавлено.\n\n${taught}`
-      : `✅ Added to knowledge base.\n\n${taught}`;
+      ? `✅ Ответ добавлен в базу знаний.\n\n«${taught}»`
+      : `✅ Answer added to knowledge base.\n\n«${taught}»`;
 
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(
@@ -186,6 +185,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   // 0) Команды — строго ДО всего.
   const cleanUserText = stripQuoted(userTextRaw);
 
+  // Проверяем команду "Ответил бы" ПЕРВОЙ
   if (isCmdTeach(cleanUserText)) {
     const msgId = await saveMessage(
       sessionId,
