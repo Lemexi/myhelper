@@ -13,11 +13,11 @@ import {
   classifyCategory, detectAnyName, detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
-  isCmdAnswerExpensive, honorific, extractGreeting, stripQuoted
+  isCmdAnswerExpensive, extractGreeting, stripQuoted
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-/* LLM фолбэк */
+/* LLM fallback */
 async function replyCore(sessionId, userTextEN) {
   const recent = await loadRecentMessages(sessionId, 24);
   const summary = await loadLatestSummary(sessionId);
@@ -29,20 +29,45 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
+/* Просьба имени */
+function buildAskName(userLang, rawText) {
+  const hi = extractGreeting(rawText);
+  const by = {
+    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
+    uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатись?`,
+    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
+    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
+    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
+  };
+  return by[userLang] || by.en;
+}
+
 /* Команды */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
-  const targetLang = targetLangWord ? targetLangWord : "en";
-  if (!text) {
+  const targetLang = (targetLangWord || "en").toLowerCase();
+
+  if (!text || text.length < 2) {
     const msg = "Нужен текст после команды «Переведи».";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate_error" }, "en", userLang, msg, "translate");
     return msg;
   }
-  const { styled, styledRu, targetLang: tgt } = await translateWithStyle({ sourceText: text, targetLang });
-  const combined = `🔁 Перевод (${tgt.toUpperCase()}):\n${styled}\n\n💬 Для тебя (RU):\n${styledRu}`;
+
+  const { targetLang: tgt, styled, styledRu } = await translateWithStyle({ sourceText: text, targetLang });
+
+  // Отдаём ДВА блока, всегда:
+  // 1) Целевая версия для клиента; 2) Для тебя (RU)
+  const combined =
+    `🔁 Перевод (${tgt.toUpperCase()}):\n` +
+    `${styled}\n\n` +
+    `💬 Для тебя (RU):\n` +
+    `${styledRu}`;
+
+  // Сохраняем канонически в EN (в БД), оригинал комбинированного — в translated_content
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, combined, "translate");
+
   return combined;
 }
 
@@ -76,54 +101,48 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* Просьба имени с зеркалингом приветствия */
-function buildAskName(userLang, rawText) {
-  const hi = extractGreeting(rawText);
-  const askByLang = {
-    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
-    uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатись?`,
-    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
-    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
-    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
-  };
-  return askByLang[userLang] || askByLang["en"];
-}
-
 /* SmartReply */
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канон: EN
+  // Канон EN + исходный язык
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } = await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // 0) Сначала команды — по «очищенному» тексту
+  // 0) Команды — строго ДО всего. Сначала обучение, потом перевод.
   const cleanedForCmd = stripQuoted(userTextRaw);
-  if (isCmdTranslate(cleanedForCmd)) {
-    const msgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
-    const out = await handleCmdTranslate(sessionId, cleanedForCmd, userLang);
-    await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
-    return out;
-  }
+
   if (isCmdTeach(cleanedForCmd)) {
-    const msgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
+    const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
     const out = await handleCmdTeach(sessionId, cleanedForCmd, userLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
   }
+
+  if (isCmdTranslate(cleanedForCmd)) {
+    const { text: t } = parseCmdTranslate(cleanedForCmd);
+    if (t && t.length >= 2) {
+      const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
+      const out = await handleCmdTranslate(sessionId, cleanedForCmd, userLang);
+      await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
+      return out;
+    }
+    // если пусто — игнор и идём дальше
+  }
+
   if (isCmdAnswerExpensive(cleanedForCmd)) {
-    const msgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
+    const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "answer_expensive" }, "en", userLang, origText, null);
     const out = await handleCmdAnswerExpensive(sessionId, userLang);
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
     return out;
   }
 
-  // 1) Имя/телефон из текущего сообщения (до ask-name)
+  // 1) Имя/телефон из текущего сообщения
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // 2) Сохраняем вход (обычный)
+  // 2) Сохраняем вход
   const userMsgId = await saveMessage(sessionId, "user", userTextEN, null, "en", userLang, origText, null);
 
   // 3) Если имени нет — зеркалим приветствие и просим имя
@@ -151,6 +170,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       strategy = "kb_translated"; kbItemId = kbRu.id;
     }
   }
+
   if (!answer) {
     answer = await replyCore(sessionId, userTextEN);
     const detectedLLM = await detectLanguage(answer);
@@ -159,10 +179,9 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   }
 
-  const finalAnswer = answer;
-  const { canonical: ansEN } = await toEnglishCanonical(finalAnswer);
+  const { canonical: ansEN } = await toEnglishCanonical(answer);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
-  await saveMessage(sessionId, "assistant", ansEN, { category, strategy }, "en", userLang, finalAnswer, category);
+  await saveMessage(sessionId, "assistant", ansEN, { category, strategy }, "en", userLang, answer, category);
 
-  return finalAnswer;
+  return answer;
 }
