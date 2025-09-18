@@ -8,9 +8,7 @@ export const pool = new Pool({
   idleTimeoutMillis: 30000,
 });
 
-/* ──────────────────────────────────────────────────────────────
-   sessions
-   ────────────────────────────────────────────────────────────── */
+/* ───────────────────────── sessions ───────────────────────── */
 export async function upsertSession(sessionKey, channel) {
   const sel = "SELECT id FROM sessions WHERE session_key=$1 LIMIT 1";
   const { rows } = await pool.query(sel, [sessionKey]);
@@ -20,13 +18,8 @@ export async function upsertSession(sessionKey, channel) {
   return insRes.rows[0].id;
 }
 
-export async function updateContact(
-  sessionId,
-  { name = null, phone = null, locale = null } = {}
-) {
-  const parts = [];
-  const vals = [];
-  let i = 1;
+export async function updateContact(sessionId, { name=null, phone=null, locale=null } = {}) {
+  const parts = []; const vals = []; let i = 1;
   if (name)  { parts.push(`user_name=$${i++}`);  vals.push(name); }
   if (phone) { parts.push(`user_phone=$${i++}`); vals.push(phone); }
   if (locale){ parts.push(`locale=$${i++}`);    vals.push(locale); }
@@ -42,63 +35,41 @@ export async function getSession(sessionId) {
   return rows[0] || null;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   messages
-   ────────────────────────────────────────────────────────────── */
-export async function saveMessage(
-  sessionId,
-  role,
-  content,
-  meta = null,
-  lang = null,
-  translated_to = null,
-  translated_content = null,
-  category = null
-) {
+/* ───────────────────────── messages ───────────────────────── */
+export async function saveMessage(sessionId, role, content, meta=null, lang=null, translated_to=null, translated_content=null, category=null) {
   const q = `
     INSERT INTO messages (session_id, role, content, meta_json, lang, translated_to, translated_content, category)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     RETURNING id
   `;
   const { rows } = await pool.query(q, [
-    sessionId,
-    role,
-    content,
+    sessionId, role, content,
     meta ? JSON.stringify(meta) : null,
-    lang,
-    translated_to,
-    translated_content,
-    category,
+    lang, translated_to, translated_content, category
   ]);
   return rows[0]?.id || null;
 }
 
-export async function loadRecentMessages(sessionId, limit = 24) {
-  const q =
-    "SELECT role, content FROM messages WHERE session_id=$1 ORDER BY id DESC LIMIT $2";
+export async function loadRecentMessages(sessionId, limit=24) {
+  const q = "SELECT role, content FROM messages WHERE session_id=$1 ORDER BY id DESC LIMIT $2";
   const { rows } = await pool.query(q, [sessionId, limit]);
-  return rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+  return rows.reverse().map(r => ({ role: r.role, content: r.content }));
 }
 
-/** Последнее сообщение ассистента — нужно для «Я бы ответил…» */
 export async function getLastAssistantMessage(sessionId) {
   const q = `
     SELECT content, translated_content, translated_to
     FROM messages
     WHERE session_id=$1 AND role='assistant'
-    ORDER BY id DESC
-    LIMIT 1
+    ORDER BY id DESC LIMIT 1
   `;
   const { rows } = await pool.query(q, [sessionId]);
   return rows[0] || null;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   summaries
-   ────────────────────────────────────────────────────────────── */
+/* ───────────────────────── summaries ───────────────────────── */
 export async function loadLatestSummary(sessionId) {
-  const q =
-    "SELECT content FROM summaries WHERE session_id=$1 ORDER BY id DESC LIMIT 1";
+  const q = "SELECT content FROM summaries WHERE session_id=$1 ORDER BY id DESC LIMIT 1";
   const { rows } = await pool.query(q, [sessionId]);
   return rows.length ? rows[0].content : null;
 }
@@ -112,29 +83,24 @@ export async function saveSummary(sessionId, turnNo, content) {
   await pool.query(q, [sessionId, turnNo, content]);
 }
 
-/* ──────────────────────────────────────────────────────────────
-   audit
-   ────────────────────────────────────────────────────────────── */
-export async function logReply(
-  sessionId,
-  strategy,
-  category,
-  kbItemId,
-  messageId = null,
-  notes = null
-) {
-  const q = `
-    INSERT INTO reply_audit (session_id, strategy, category, kb_item_id, message_id, notes)
-    VALUES ($1,$2,$3,$4,$5,$6)
-  `;
-  await pool.query(q, [
-    sessionId,
-    strategy,
-    category,
-    kbItemId,
-    messageId,
-    notes,
-  ]);
+/* ───────────────────────── audit ───────────────────────── */
+export async function logReply(sessionId, strategy, category, kbItemId, messageId=null, notes=null) {
+  const safe = (s) => {
+    const allowed = new Set([
+      "kb_qna","kb_hit","kb_translated","fallback_llm",
+      "cmd_translate","cmd_teach","cmd_expensive"
+    ]);
+    return allowed.has(s) ? s : "fallback_llm";
+  };
+  try {
+    const q = `
+      INSERT INTO reply_audit (session_id, strategy, category, kb_item_id, message_id, notes)
+      VALUES ($1,$2,$3,$4,$5,$6)
+    `;
+    await pool.query(q, [sessionId, safe(strategy), category, kbItemId, messageId, notes]);
+  } catch (e) {
+    console.error("logReply failed (soft):", e.message);
+  }
 }
 
 export async function getLastAuditCategory(sessionId) {
@@ -149,52 +115,62 @@ export async function getLastAuditCategory(sessionId) {
   return rows[0]?.category || null;
 }
 
-/* ──────────────────────────────────────────────────────────────
-   QnA (kb_qna): пары вопрос→ответ, чтобы отвечать из БД до LLM
-   ────────────────────────────────────────────────────────────── */
+/* ───────────────────────── KB (категории) ───────────────────────── */
+export async function kbFind(categorySlug, lang) {
+  const q = `
+    SELECT ki.id, ki.answer
+    FROM kb_items ki
+    JOIN kb_categories kc ON kc.id = ki.category_id
+    WHERE kc.slug = $1 AND ki.lang = $2 AND ki.is_active = TRUE
+    ORDER BY ki.id ASC
+    LIMIT 1
+  `;
+  const { rows } = await pool.query(q, [categorySlug, lang]);
+  return rows[0] || null;
+}
 
-/** Найти QnA по нормализованному EN-вопросу и языку ответа */
+export async function kbEnsureCategory(slug, title = null) {
+  const sel = `SELECT id FROM kb_categories WHERE slug=$1 LIMIT 1`;
+  const r1 = await pool.query(sel, [slug]);
+  if (r1.rows.length) return r1.rows[0].id;
+  const ins = `INSERT INTO kb_categories (slug, title) VALUES ($1, $2) RETURNING id`;
+  const r2 = await pool.query(ins, [slug, title || slug]);
+  return r2.rows[0].id;
+}
+
+export async function kbInsertAnswer(slug, lang, answer, isActive = true) {
+  const catId = await kbEnsureCategory(slug);
+  const q = `
+    INSERT INTO kb_items (category_id, lang, answer, is_active)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id
+  `;
+  const { rows } = await pool.query(q, [catId, lang, answer, isActive]);
+  return rows[0]?.id || null;
+}
+
+/* ───────────────────────── KB QnA (новый слой) ───────────────────────── */
 export async function qnaFind(lang, questionNormEn) {
   const q = `
     SELECT id, answer_text
     FROM kb_qna
     WHERE lang=$1 AND md5(question_norm_en)=md5($2)
-    ORDER BY id DESC
-    LIMIT 1
+    ORDER BY id DESC LIMIT 1
   `;
   const { rows } = await pool.query(q, [lang, questionNormEn]);
   return rows[0] || null;
 }
 
-/** Отметить использование записи (счётчик/последний доступ) */
 export async function qnaTouchUse(id) {
-  await pool.query(
-    `UPDATE kb_qna SET uses=uses+1, last_used_at=NOW() WHERE id=$1`,
-    [id]
-  );
+  await pool.query(`UPDATE kb_qna SET uses=uses+1, last_used_at=NOW() WHERE id=$1`, [id]);
 }
 
-/** Вставить новую пару вопрос→ответ */
-export async function qnaInsert({
-  lang,
-  questionNormEn,
-  questionRaw,
-  answerText,
-  source = "teach",
-  sessionId = null,
-}) {
+export async function qnaInsert({ lang, questionNormEn, questionRaw, answerText, source='teach', sessionId }) {
   const q = `
     INSERT INTO kb_qna (lang, question_norm_en, question_raw, answer_text, source, session_id)
     VALUES ($1,$2,$3,$4,$5,$6)
     RETURNING id
   `;
-  const { rows } = await pool.query(q, [
-    lang,
-    questionNormEn,
-    questionRaw,
-    answerText,
-    source,
-    sessionId,
-  ]);
+  const { rows } = await pool.query(q, [lang, questionNormEn, questionRaw, answerText, source, sessionId]);
   return rows[0]?.id || null;
 }
