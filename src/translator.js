@@ -2,7 +2,7 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ── Маппинг слов → коды ── */
+/* маппинг */
 const LangMap = {
   "английский": "en", english: "en", eng: "en", en: "en",
   "чешский": "cz", czech: "cz", cz: "cz", cs: "cz",
@@ -16,7 +16,7 @@ export function resolveTargetLangCode(word) {
   return LangMap[key] || null;
 }
 
-/* ── Детект языка ── */
+/* детект языка */
 export async function detectLanguage(text) {
   const { text: out } = await runLLM([
     { role: "system", content: "Detect language code among: en,ru,uk,pl,cz. Output only the code." },
@@ -26,7 +26,7 @@ export async function detectLanguage(text) {
   return ["en","ru","uk","pl","cz"].includes(code) ? code : "en";
 }
 
-/* ── Кэш перевода ── */
+/* кэш перевода */
 export async function translateCached(text, sourceLang, targetLang) {
   if (!text || sourceLang === targetLang) return { text, cached: true };
 
@@ -46,14 +46,13 @@ export async function translateCached(text, sourceLang, targetLang) {
 
   const ins = `
     INSERT INTO translations_cache (source_text, source_lang, target_lang, translated_text, by_model)
-    VALUES ($1,$2,$3,$4,$5)
-    ON CONFLICT DO NOTHING
+    VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING
   `;
   await pool.query(ins, [text, sourceLang, targetLang, translated, "groq"]);
   return { text: translated, cached: false };
 }
 
-/* ── Канонизация: всё в EN ── */
+/* канон EN */
 export async function toEnglishCanonical(text) {
   const src = await detectLanguage(text);
   if (src === "en") return { canonical: text, sourceLang: "en", original: text };
@@ -61,37 +60,33 @@ export async function toEnglishCanonical(text) {
   return { canonical, sourceLang: src, original: text };
 }
 
-/* ── Перевод с «усилением»: целевой + RU; опциональная альтернатива ── */
+/* перевод с усилением + альтернатива (опционально) */
 export async function translateWithStyle({ sourceText, targetLang }) {
   const target = (targetLang || "en").toLowerCase();
 
-  // Основной вариант (строго без пояснений)
   const { text: styled } = await runLLM([
     {
       role: "system",
       content:
-        "Rewrite for B2B WhatsApp: 1–4 short sentences, confident, warm, persuasive but ethical; soft Cialdini (max 1–2). " +
-        "Output ONLY the rewritten text in the target language. No headings, no quotes, no explanations."
+        "Rewrite for B2B WhatsApp: 1–4 short sentences, confident, warm, persuasive but ethical; soft Cialdini (max 2). " +
+        "Output ONLY the rewritten text in the target language. No headings, quotes or explanations."
     },
     { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // Альтернативный вариант (может вернуть пустую строку — тогда его нет)
   const { text: altMaybe } = await runLLM([
     {
       role: "system",
       content:
-        "Provide ONE alternative rephrase of the user's text in the same target language. " +
-        "Keep 1–4 sentences, same constraints. If the original is already optimal, return exactly an empty string. " +
-        "Output only the alternative text (or empty string)."
+        "Provide ONE alternative rephrase in the same target language. 1–4 sentences. " +
+        "If not needed, return an empty string. Output only the text or empty."
     },
     { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // Русские версии
-  const styledRu   = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
-  const altClean   = (altMaybe || "").trim();
-  const altStyled  = altClean ? altClean : "";
+  const styledRu    = target === "ru" ? styled    : (await translateCached(styled,    target, "ru")).text;
+  const alt = (altMaybe || "").trim();
+  const altStyled   = alt || "";
   const altStyledRu = altStyled ? (target === "ru" ? altStyled : (await translateCached(altStyled, target, "ru")).text) : "";
 
   return { targetLang: target, styled, styledRu, altStyled, altStyledRu };
