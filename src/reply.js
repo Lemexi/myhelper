@@ -6,20 +6,18 @@ import {
 } from "./db.js";
 import { kbFind, kbInsertAnswer } from "./kb.js";
 import {
-  translateCached, translateWithStyle, resolveTargetLangCode,
+  translateCached, translateWithStyle,
   toEnglishCanonical, detectLanguage
 } from "./translator.js";
 import {
-  classifyCategory, detectName, detectPhone,
+  classifyCategory, detectName, detectStandaloneName, detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
-  isCmdAnswerExpensive, honorific, guessGenderByName
+  isCmdAnswerExpensive, honorific, guessGenderByName, extractGreeting
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-/* ─────────────────────────────────────────
-   LLM фолбэк с контекстом и сводкой
-────────────────────────────────────────── */
+/* ─────────── LLM фолбэк ─────────── */
 async function replyCore(sessionId, userTextEN) {
   const recent = await loadRecentMessages(sessionId, 24);
   const summary = await loadLatestSummary(sessionId);
@@ -33,38 +31,36 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* ─────────────────────────────────────────
-   Команды: Переведи / Ответил бы / Ответь на дорого
-────────────────────────────────────────── */
+/* ─────────── Команды ─────────── */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
-  const targetLang = resolveTargetLangCode(targetLangWord) || "en";
+  const targetLang = targetLangWord ? targetLangWord : "en";
   if (!text) {
     const msg = "Нужен текст после команды «Переведи».";
-    await saveMessage(sessionId, "assistant", msg, { category: "translate", strategy: "cmd_translate_error" }, "en", userLang, rawText, "translate");
+    const { canonical } = await toEnglishCanonical(msg);
+    await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate_error" }, "en", userLang, msg, "translate");
     return msg;
   }
   const { styled, styledRu, targetLang: tgt } = await translateWithStyle({ sourceText: text, targetLang });
   const combined = `🔁 Перевод (${tgt.toUpperCase()}):\n${styled}\n\n💬 Для тебя (RU):\n${styledRu}`;
-  // Канонически в EN
   const { canonical } = await toEnglishCanonical(combined);
-  await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, rawText, "translate");
+  await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, combined, "translate");
   return combined;
 }
 
 async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
-    const msg = "Нужен текст после «Ответил бы:».";
-    await saveMessage(sessionId, "assistant", msg, { category: "teach", strategy: "cmd_teach_error" }, "en", userLang, rawText, "teach");
+    const msg = "Нужен текст после «Ответил бы».";
+    const { canonical } = await toEnglishCanonical(msg);
+    await saveMessage(sessionId, "assistant", canonical, { category: "teach", strategy: "cmd_teach_error" }, "en", userLang, msg, "teach");
     return msg;
   }
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
-  const ack = "✅ В базу добавлено.";
-  const out = `${ack}\n\n${taught}`;
+  const out = `✅ В базу добавлено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
-  await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId }, "en", userLang, rawText, lastCat);
+  await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId }, "en", userLang, out, lastCat);
   return out;
 }
 
@@ -87,64 +83,39 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* ─────────────────────────────────────────
-   Имя и обращение
-────────────────────────────────────────── */
-function addAddressing(answerText, userLang, session) {
-  const name = session?.user_name?.trim();
-  if (name) return answerText; // имя есть — не навязываем обращение
-  const gender = "male"; // по умолчанию
-  const hon = honorific(userLang || "ru", gender);
-  return `${hon}, ${answerText}`;
+/* ─────────── Умное приветствие + просьба имени ─────────── */
+function buildAskName(userLang, rawText) {
+  const hi = extractGreeting(rawText); // зеркалим если есть
+  const askByLang = {
+    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
+    uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатись?`,
+    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
+    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
+    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
+  };
+  return askByLang[userLang] || askByLang["en"];
 }
 
-/* ─────────────────────────────────────────
-   Основной SmartReply
-────────────────────────────────────────── */
+/* ─────────── SmartReply ─────────── */
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канонизируем вход: всё в EN, оригинал сохраняем в полях translated_*
+  // Канонизируем вход: всё в EN, оригинал сохраняем
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } = await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // Обновим контакты (если прислали)
-  const nameDetected = detectName(userTextRaw);
+  // Детект контактов
+  let nameDetected = detectName(userTextRaw) || detectStandaloneName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameDetected || phone) await updateContact(sessionId, { name: nameDetected, phone });
 
-  // Сохраняем входящее как EN
+  // Сохраняем входящее (канон EN)
   const userMsgId = await saveMessage(
-    sessionId,
-    "user",
-    userTextEN,
-    null,
-    "en",            // lang (канонически EN)
-    userLang,        // translated_to (исходный язык пользователя)
-    origText,        // translated_content (оригинал)
-    null
+    sessionId, "user", userTextEN,
+    null, "en", userLang, origText, null
   );
 
-  // Сессия (для имени)
-  const session = await getSession(sessionId);
-  const currentName = session?.user_name?.trim();
-
-  // Если имени нет и это не команда — сначала спросим имя
-  if (!currentName && !isCmdTranslate(userTextRaw) && !isCmdTeach(userTextRaw) && !isCmdAnswerExpensive(userTextRaw)) {
-    const askNameByLang = {
-      ru: "Как вас зовут? Имя нужно для договора и общения.",
-      uk: "Як вас звати? Ім’я потрібне для договору і спілкування.",
-      pl: "Jak masz na imię? Imię potrzebne do umowy i kontaktu.",
-      cz: "Jak se jmenujete? Jméno je potřeba do smlouvy a komunikace.",
-      en: "How should I address you? Your name is needed for the agreement and communication."
-    };
-    const ask = askNameByLang[userLang] || askNameByLang["en"];
-    const { canonical } = await toEnglishCanonical(ask);
-    await saveMessage(sessionId, "assistant", canonical, { category: "ask_name", strategy: "precheck_name" }, "en", userLang, ask, "ask_name");
-    return ask;
-  }
-
-  // Команды (высший приоритет)
+  // Команды — перехватываем до всего
   if (isCmdTranslate(userTextRaw)) {
     const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
     await logReply(sessionId, "cmd", "translate", null, userMsgId, "trigger: translate");
@@ -161,10 +132,21 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // Классификация
+  // Проверим, знаем ли имя в сессии (после возможного апдейта)
+  const session = await getSession(sessionId);
+  const currentName = session?.user_name?.trim();
+
+  // Если имени НЕТ → зеркалим приветствие и культурно просим имя (один раз)
+  if (!currentName) {
+    const ask = buildAskName(userLang, userTextRaw);
+    const { canonical } = await toEnglishCanonical(ask);
+    await saveMessage(sessionId, "assistant", canonical, { category: "ask_name", strategy: "precheck_name" }, "en", userLang, ask, "ask_name");
+    return ask;
+  }
+
+  // Дальше обычная цепочка: классификация → KB → перевод → LLM
   const category = await classifyCategory(userTextRaw);
 
-  // KB → перевод → LLM
   let kb = await kbFind(category, userLang);
   let answer, strategy = "fallback_llm", kbItemId = null;
 
@@ -181,10 +163,10 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       kbItemId = kbRu.id;
     }
   }
+
   if (!answer) {
-    // В LLM отправляем EN-контекст
+    // Фолбэк через LLM (в EN) + при необходимости перевод ответа на язык пользователя
     answer = await replyCore(sessionId, userTextEN);
-    // И переводим результат на язык пользователя
     const detectedLLM = await detectLanguage(answer);
     if (detectedLLM !== userLang) {
       const { text: translatedOut } = await translateCached(answer, detectedLLM, userLang);
@@ -192,22 +174,13 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   }
 
-  // Вставим обращение (если имени нет)
-  const finalAnswer = addAddressing(answer, userLang, session);
+  // Обращение (Сэр/Мэм) только если имени нет — но имя уже есть, поэтому не добавляем
+  const finalAnswer = answer;
 
-  // Сохраняем исходящее как EN (канон), а пользовательский язык — в translated_*
+  // Сохраняем исходящее канонически EN
   const { canonical: ansEN } = await toEnglishCanonical(finalAnswer);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
-  await saveMessage(
-    sessionId,
-    "assistant",
-    ansEN,
-    { category, strategy },
-    "en",
-    userLang,
-    finalAnswer,
-    category
-  );
+  await saveMessage(sessionId, "assistant", ansEN, { category, strategy }, "en", userLang, finalAnswer, category);
 
   return finalAnswer;
 }
