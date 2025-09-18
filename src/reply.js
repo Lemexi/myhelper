@@ -3,14 +3,15 @@ import { SYSTEM_PROMPT } from "./prompt.js";
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
   loadLatestSummary, logReply, getLastAuditCategory, getSession,
-  // QnA helpers:
-  qnaFind, qnaTouchUse, getLastAssistantMessage, qnaInsert
+  qnaFind, qnaTouchUse, getLastAssistantMessage, qnaInsert,
+  kbFind, kbInsertAnswer
 } from "./db.js";
-import { kbFind, kbInsertAnswer } from "./kb.js";
+
 import {
   translateCached, translateWithStyle,
   toEnglishCanonical, detectLanguage
 } from "./translator.js";
+
 import {
   classifyCategory, detectAnyName, detectPhone,
   isCmdTeach, parseCmdTeach,
@@ -18,9 +19,10 @@ import {
   isCmdAnswerExpensive, extractGreeting, stripQuoted,
   norm
 } from "./classifier.js";
+
 import { runLLM } from "./llm.js";
 
-/* LLM fallback */
+/* ───────────────────────── LLM fallback ───────────────────────── */
 async function replyCore(sessionId, userTextEN) {
   const recent = await loadRecentMessages(sessionId, 24);
   const summary = await loadLatestSummary(sessionId);
@@ -32,7 +34,7 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* Просьба имени */
+/* ───────────────────────── Просьба имени ───────────────────────── */
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
   const by = {
@@ -45,7 +47,7 @@ function buildAskName(userLang, rawText) {
   return by[userLang] || by.en;
 }
 
-/* Команды */
+/* ───────────────────────── Команды ───────────────────────── */
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord || "en").toLowerCase();
@@ -57,30 +59,34 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
+  // маркетинговая стилизация
   const { targetLang: tgt, styled, styledRu } = await translateWithStyle({ sourceText: text, targetLang });
 
-  // Сохраняем как QnA по исходной фразе (чтобы в следующий раз отдать готовый стиль)
-  const { canonical: qCanonEN } = await toEnglishCanonical(text);
-  const qNormEN = norm((qCanonEN || "").toLowerCase());
-  await qnaInsert({
-    lang: tgt,
-    questionNormEn: qNormEN,
-    questionRaw: text,
-    answerText: styled,
-    source: "translate",
-    sessionId
-  });
-
-  // Отдаём ДВА блока:
+  // Комбинированная выдача (как было)
   const combined =
     `🔁 Перевод (${tgt.toUpperCase()}):\n` +
     `${styled}\n\n` +
     `💬 Для тебя (RU):\n` +
     `${styledRu}`;
 
-  // Сохраняем канонически в EN (в БД), оригинал комбинированного — в translated_content
+  // сохраняем ассистентское сообщение
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(sessionId, "assistant", canonical, { category: "translate", strategy: "cmd_translate" }, "en", userLang, combined, "translate");
+  await logReply(sessionId, "cmd_translate", "translate", null, null, "trigger: translate");
+
+  // + кладём как QnA: вопрос — исходный текст (канон EN), ответ — styled (целевой язык)
+  const { canonical: qCanonEN } = await toEnglishCanonical(text);
+  const qNormEN = norm((qCanonEN || "").toLowerCase());
+  if (qNormEN && styled) {
+    await qnaInsert({
+      lang: tgt,
+      questionNormEn: qNormEN,
+      questionRaw: text,
+      answerText: styled,
+      source: "translate",
+      sessionId
+    });
+  }
 
   return combined;
 }
@@ -100,7 +106,6 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const { canonical: qCanonEN } = await toEnglishCanonical(baseQuestion || "");
   const qNormEN = norm((qCanonEN || "").toLowerCase());
 
-  // Пишем в QnA (приоритетная база для быстрых ответов)
   const qnaId = await qnaInsert({
     lang: userLang,
     questionNormEn: qNormEN,
@@ -110,13 +115,14 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
     sessionId
   });
 
-  // (опционально) дублируем в KB по последней категории — как у тебя было
+  // (опц.) дублируем в KB по последней категории
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
 
   const out = `✅ Запомнил ответ на последний вопрос. Теперь буду отвечать так:\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId, qna_id: qnaId }, "en", userLang, out, lastCat);
+  await logReply(sessionId, "cmd_teach", lastCat, kbId, null, `teach->qna:${qnaId}`);
   return out;
 }
 
@@ -129,12 +135,12 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     answer = await replyCore(sessionId, "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA.");
   }
   const { canonical } = await toEnglishCanonical(answer);
-  await saveMessage(sessionId, "assistant", canonical, { category: "expensive", strategy: "cmd_answer_expensive" }, "en", userLang, answer, "expensive");
-  await logReply(sessionId, "cmd", "expensive", kb?.id || null, null, "trigger: answer expensive");
+  await saveMessage(sessionId, "assistant", canonical, { category: "expensive", strategy: "cmd_expensive" }, "en", userLang, answer, "expensive");
+  await logReply(sessionId, "cmd_expensive", "expensive", kb?.id || null, null, "trigger: answer expensive");
   return answer;
 }
 
-/* SmartReply */
+/* ───────────────────────── SmartReply ───────────────────────── */
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
@@ -148,7 +154,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   if (isCmdTeach(cleanedForCmd)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
     const out = await handleCmdTeach(sessionId, cleanedForCmd, userLang);
-    await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
+    await logReply(sessionId, "cmd_teach", "teach", null, msgId, "trigger: teach");
     return out;
   }
 
@@ -157,7 +163,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     if (t && t.length >= 2) {
       const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
       const out = await handleCmdTranslate(sessionId, cleanedForCmd, userLang);
-      await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
+      await logReply(sessionId, "cmd_translate", "translate", null, msgId, "trigger: translate");
       return out;
     }
     // если пусто — игнор и идём дальше
@@ -166,7 +172,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   if (isCmdAnswerExpensive(cleanedForCmd)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN, { kind: "cmd_detected", cmd: "answer_expensive" }, "en", userLang, origText, null);
     const out = await handleCmdAnswerExpensive(sessionId, userLang);
-    await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
+    await logReply(sessionId, "cmd_expensive", "expensive", null, msgId, "trigger: answer expensive");
     return out;
   }
 
@@ -188,13 +194,13 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // 4) QnA поверх всего (до KB/LLM)
-  const qNormEN = norm((userTextEN || "").toLowerCase());
+  // 4) QnA (точное совпадение по нормализованному EN) — ПЕРВЫМ делом
+  const qNormEN = norm(userTextEN.toLowerCase());
   const qnaHit = await qnaFind(userLang, qNormEN);
   if (qnaHit) {
     const answer = qnaHit.answer_text;
     const { canonical: ansEN } = await toEnglishCanonical(answer);
-    await saveMessage(sessionId, "assistant", ansEN, { category: "qna", strategy: "kb_qna" }, "en", userLang, answer, "qna");
+    await saveMessage(sessionId, "assistant", ansEN, { category: "qna", strategy: "kb_qna", qna_id: qnaHit.id }, "en", userLang, answer, "qna");
     await qnaTouchUse(qnaHit.id);
     await logReply(sessionId, "kb_qna", "qna", null, userMsgId, "hit by norm EN");
     return answer;
