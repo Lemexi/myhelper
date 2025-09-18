@@ -19,28 +19,56 @@ export function stripQuoted(raw = "") {
 }
 
 /* ─────────── Триггеры-команды ─────────── */
-// Принимаем любые формы: с/без двоеточия, в любом месте строки
+
+// === КОМАНДА "Я БЫ ОТВЕТИЛ/А" ===
+// Принимаем любые формы: порядок слов, женскую форму, и без "бы"
 export function isCmdTeach(raw = "") {
   const t = lower(stripQuoted(raw));
-  return /(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\b/.test(t);
+  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)(?=\s|:|,|-|$)/i.test(t);
 }
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  const m = t.match(/(я\s*бы\s*ответил[аи]?|я\s*ответил[аи]?\s*бы|ответил[аи]?\s*бы)\s*[:\-,]?\s*(.+)$/is);
-  return m ? m[2].trim() : null;
+  const re = /(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)[\s:,\-]*([\s\S]+)$/i;
+  const m = t.match(re);
+  return m ? m[6].trim() : null;
 }
 
+// === КОМАНДА "ПЕРЕВЕДИ" (рус/укр/англ + флаги) ===
+const LANG_TOKENS = [
+  "переведи", "переклади", "translate", "translation", "tl"
+];
+// пара «региональных» флагов (эмодзи) — базовый признак наличия флага
+const FLAG_PAIR_RE = /([\u{1F1E6}-\u{1F1FF}]{2})/u;
+
 export function isCmdTranslate(raw = "") {
-  const t = lower(stripQuoted(raw));
-  return /\bпереведи(\s+на\s+[a-zA-ZА-Яа-яёіїєґ]+)?\b/.test(t);
+  const body = stripQuoted(raw);
+  const t = lower(body);
+  const hasKeyword = LANG_TOKENS.some(k => t.startsWith(k) || t.includes(` ${k} `));
+  const hasFlag = FLAG_PAIR_RE.test(body);
+  return hasKeyword || hasFlag;
 }
+
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  const re = /переведи(?:\s+на\s+([a-zA-ZА-Яа-яёіїєґ]+))?\s*[:\-,]?\s*(.*)$/is;
+
+  // 1) Язык по флагу (если есть — берём первый)
+  const flagMatch = t.match(FLAG_PAIR_RE);
+  const flag = flagMatch ? flagMatch[1] : null;
+
+  // 2) "переведи/переклади/translate (to) на <язык>: <текст>"
+  const re =
+    /(?:переведи|переклади|translate(?:\s+to)?)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?[\s:,\-]*([\s\S]*)$/i;
   const m = t.match(re);
-  const lang = (m?.[1] || "").trim().toLowerCase() || null;
-  const text = (m?.[2] || "").trim() || "";
-  return { targetLangWord: lang, text };
+  const langWord = (m?.[1] || "").trim();
+  let text = (m?.[2] || "").trim();
+
+  // 3) Фолбэк: если была конструкция "🇬🇧 <текст>" без ключевого слова
+  if (!m && flag) {
+    text = t.replace(flag, "").trim();
+  }
+
+  const targetLangWord = flag ? flag : (langWord || null);
+  return { targetLangWord, text };
 }
 
 export function isCmdAnswerExpensive(raw = "") {
@@ -79,7 +107,7 @@ export const classifyCategory = classifyCategoryRuleBased;
 /* ─────────── Имя / телефон ─────────── */
 export function detectNameSentence(text) {
   const m = text?.match(
-    /\b(меня зовут|i am|my name is|мене звати|mam na imię|jmenuji se)\s+([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][\p{L}\-']{1,}\s*[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ\p{L}\-']*)/iu
+    /\b(меня зовут|i am|my name is|мене звати|mam na imię|jmenuji se)\s+([A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠČŘÝÁÍÉÜÖÄ][\p{L}\-']{1,}\s*[A-ZА-ЯЁЇІЄҐŁŚŻŹĆŃÓĎŠŠČŘÝÁÍÉÜÖÄ\p{L}\-']*)/iu
   );
   return m ? m[2].trim() : null;
 }
