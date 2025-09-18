@@ -1,8 +1,7 @@
-// /src/classifier.js
+// src/classifier.js
 
-// Нормализация и чистка цитат/префиксов
+// Нормализация строки
 export function norm(s = "") {
-  // аккуратно приводим пробелы и кавычки
   return (s || "")
     .replace(/\s+/g, " ")
     .replace(/[«»“”"'\u00A0]/g, '"')
@@ -10,62 +9,61 @@ export function norm(s = "") {
 }
 export function lower(s = "") { return norm(s).toLowerCase(); }
 
+// Удаление цитат и служебных строк
 export function stripQuoted(raw = "") {
   const lines = (raw || "").split(/\r?\n/);
   const clean = [];
   for (const ln of lines) {
     const l = ln.trim();
     if (!l) continue;
-    if (l.startsWith(">")) continue; // цитаты
-    if (/^assistant\b|renovogo\.com|^bot\b|^from:|^replying to/i.test(l)) continue; // шапки
+    if (l.startsWith(">")) continue;
+    if (/^assistant\b|renovogo\.com|^bot\b|^from:|^replying to/i.test(l)) continue;
     clean.push(l);
   }
   return clean.join("\n").trim();
 }
 
-/* ─────────── Триггеры-команды ─────────── */
-
-// «Я бы ответил/а …» — ловим варианты порядка слов и женскую форму. Упрощено.
+// --- Команда "я бы ответил/а" ---
+// Максимально гибко: триггер — начало строки ("я бы ответил" или "я бы ответила"), остальное — текст ответа
 export function isCmdTeach(raw = "") {
-  const t = lower(raw);
-  // Упрощённое регулярное выражение
-  return /\b(я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)\b/.test(t);
+  const t = lower(stripQuoted(raw));
+  return t.startsWith("я бы ответил") || t.startsWith("я бы ответила");
 }
-
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
-  // Упрощённое регулярное выражение
-  const re = /(?:я\s*бы\s*ответил(а)?|я\s*ответил(а)?\s*бы|ответил(а)?\s*бы|я\s*ответил(а)?)\s*([\s\S]+)$/i;
+  const re = /^я\s*бы\s*ответил(а)?[\s:,\-]*(.*)$/i;
   const m = t.match(re);
   if (!m) return null;
-  const groups = Array.from(m);
-  const last = groups.pop();
-  return (last || "").trim() || null;
+  const taught = (m[2] || "").trim();
+  return taught.length > 0 ? taught : null;
 }
 
-// Перевод: поддержим «переведи», «переклади», «translate (to)»
+// --- Команда "переведи" ---
+// Ловит любые варианты начала, язык опционально, остальное — текст
 export function isCmdTranslate(raw = "") {
-  const t = lower(raw);
-  return /\b(переведи|переклади|translate)\b/.test(t);
+  const t = lower(stripQuoted(raw));
+  return t.startsWith("переведи") || t.startsWith("переклади") || t.startsWith("translate");
 }
-
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  // Обновлённое рег. выражение, чтобы поймать текст после команды даже без знаков препинания
-  const re = /(?:переведи|переклади|translate)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?\s*([\s\S]*)$/i;
+  // Например: "переведи на английский текст" или просто "переведи текст"
+  const re = /(?:переведи|переклади|translate)(?:\s*(?:на|to)\s*([A-Za-zА-Яа-яёіїєґ\. ]{0,20}))?[\s:,\-]*(.*)$/i;
   const m = t.match(re);
   const lang = (m?.[1] || "").trim().toLowerCase() || null;
   const text = (m?.[2] || "").trim() || "";
   return { targetLangWord: lang, text };
 }
 
+// --- Дорого --- (оставлено без изменений)
 export function isCmdAnswerExpensive(raw = "") {
-  const s = lower(raw);
+  const s = lower(stripQuoted(raw));
   return s.includes("ответь на дорого") || s.includes("агент говорит что дорого");
 }
 export function isCmdAnswerGeneric(raw = "") {
   return /^ответь\s+на\s+/i.test(stripQuoted(raw));
 }
+
+// --- Остальные утилиты из оригинала (имя, телефон, классификация и т.д.) оставляй без изменений ---
 
 /* ─────────── Приветствия ─────────── */
 const greetMap = [
