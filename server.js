@@ -1,5 +1,5 @@
-// server.js — RenovoGo Bot v2 (modular: PG + Groq + Telegram + KB/Translate)
-// Node >= 18 (есть глобальный fetch)
+// server.js — RenovoGo Bot v2 (PG + Groq + Telegram + KB/Translate)
+// Node >= 18
 
 import 'dotenv/config';
 import express from 'express';
@@ -26,9 +26,7 @@ if (!process.env.DATABASE_URL) console.warn('⚠ DATABASE_URL not set');
 if (!process.env.GROQ_API_KEY) console.warn('⚠ GROQ_API_KEY not set');
 if (!BOT_TOKEN) console.warn('⚠ BOT_TOKEN not set');
 
-// ──────────────────────────────────────────────────────────────────────────────
 // 1) HEALTH / DEBUG
-// ──────────────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('RenovoGo Bot is up'));
 
 app.get('/api/ping', (req, res) => {
@@ -48,7 +46,7 @@ app.get('/debug/memory', async (req, res) => {
   res.json({ ok: true, note: 'Using Postgres for memory' });
 });
 
-// Экспорт истории сессии (для отладки/аналитики)
+// Экспорт истории сессии
 app.get('/api/export/:sessionKey', async (req, res) => {
   try {
     const sessionKey = req.params.sessionKey;
@@ -67,25 +65,23 @@ app.get('/api/export/:sessionKey', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 2) HTTP API ДЛЯ ВЕБ-ФРОНТА
-// ──────────────────────────────────────────────────────────────────────────────
+// 2) HTTP API
 app.post('/api/reply', async (req, res) => {
   const { session_id = 'web:local', channel = 'site', text = '', lang = 'ru' } = req.body || {};
   if (!text) return res.status(400).json({ ok: false, error: 'text required' });
 
   try {
     const out = await smartReply(session_id, channel, text, lang);
-    res.json({ ok: true, text: out });
+    // out может быть строкой (старый путь) или массивом сообщений
+    if (Array.isArray(out)) return res.json({ ok: true, texts: out });
+    return res.json({ ok: true, text: out });
   } catch (e) {
     console.error('/api/reply error', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
 // 3) TELEGRAM WEBHOOK
-// ──────────────────────────────────────────────────────────────────────────────
 app.get(`/telegram/${WEBHOOK_SECRET}`, (req, res) => {
   res.json({ ok: true, via: 'GET', expected: `/telegram/${WEBHOOK_SECRET}` });
 });
@@ -104,9 +100,18 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
     }
 
     const answer = await smartReply(`tg:${chatId}`, 'telegram', text, 'ru');
-    await tgSend(chatId, answer);
 
-    // Telegram всегда ждёт 200, иначе будет слать дубликаты
+    // Если ответ — массив, отправляем по одному сообщению
+    if (Array.isArray(answer)) {
+      for (const piece of answer) {
+        if (piece && String(piece).trim()) {
+          await tgSend(chatId, piece);
+        }
+      }
+    } else {
+      await tgSend(chatId, answer);
+    }
+
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Telegram webhook error', e);
@@ -114,9 +119,7 @@ app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 4) ЗАПУСК
-// ──────────────────────────────────────────────────────────────────────────────
+// 4) START
 app.listen(PORT, () => {
   console.log(`▶ RenovoGo Bot listening on :${PORT}`);
 });
