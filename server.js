@@ -1,6 +1,4 @@
 // server.js — RenovoGo Bot (PG + Groq + Telegram + KB/Teach/Translate)
-// Node >= 18
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -22,30 +20,32 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "dev";
 
 console.log("▶ Timezone:", TZ);
 console.log("▶ Expected webhook path:", `/telegram/${WEBHOOK_SECRET}`);
-console.log("▶ Features: Teach-on-last-bot, Corrections, Split-translate");
+console.log("▶ Features: /teach(last bot), /translate, corrections gating");
 if (!process.env.DATABASE_URL) console.warn("⚠ DATABASE_URL not set");
 if (!process.env.GROQ_API_KEY) console.warn("⚠ GROQ_API_KEY not set");
 if (!BOT_TOKEN) console.warn("⚠ BOT_TOKEN not set");
+
+// helper: отправить 1 строку или массив строк
+async function tgSendAny(chatId, out){
+  const arr = Array.isArray(out) ? out : [out];
+  for (const piece of arr) {
+    if (!piece) continue;
+    await tgSend(chatId, piece);
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 1) HEALTH / DEBUG
 // ──────────────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.send("RenovoGo Bot is up"));
-
 app.get("/api/ping", (req, res) => {
-  res.json({
-    ok: true,
-    ts: Date.now(),
-    env: {
-      has_DB: !!process.env.DATABASE_URL,
-      has_GROQ: !!process.env.GROQ_API_KEY,
-      has_BOT: !!BOT_TOKEN,
-      webhook: `/telegram/${WEBHOOK_SECRET}`,
-    },
-  });
+  res.json({ ok:true, ts:Date.now(), env:{
+    has_DB:!!process.env.DATABASE_URL,
+    has_GROQ:!!process.env.GROQ_API_KEY,
+    has_BOT:!!BOT_TOKEN,
+    webhook:`/telegram/${WEBHOOK_SECRET}`
+  }});
 });
-
-// Экспорт истории сессии (для отладки/аналитики)
 app.get("/api/export/:sessionKey", async (req, res) => {
   try {
     const sessionKey = req.params.sessionKey;
@@ -59,69 +59,58 @@ app.get("/api/export/:sessionKey", async (req, res) => {
     const { rows } = await pool.query(q, [sessionId]);
     res.json({ ok: true, session: sessionKey, messages: rows });
   } catch (e) {
-    console.error("/api/export error", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** вспомогалка: отправить 1 строку или массив строк в TG */
-async function tgSendAny(chatId, maybeArray) {
-  const arr = Array.isArray(maybeArray) ? maybeArray : [maybeArray];
-  for (const piece of arr) {
-    if (!piece) continue;
-    await tgSend(chatId, piece);
-  }
-}
-
-// 2) HTTP API для веб-фронта
+// 2) HTTP API для веба
 // ──────────────────────────────────────────────────────────────────────────────
 app.post("/api/reply", async (req, res) => {
-  const { session_id = "web:local", channel = "site", text = "", lang = "ru" } = req.body || {};
-  if (!text) return res.status(400).json({ ok: false, error: "text required" });
-
+  const { session_id="web:local", channel="site", text="", lang="ru" } = req.body || {};
+  if (!text) return res.status(400).json({ ok:false, error:"text required" });
   try {
     const out = await smartReply(session_id, channel, text, lang);
-    res.json({ ok: true, text: Array.isArray(out) ? out.join("\n\n") : out });
+    res.json({ ok:true, text: Array.isArray(out) ? out.join("\n\n") : out });
   } catch (e) {
     console.error("/api/reply error", e);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok:false, error:e.message });
   }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 3) TELEGRAM WEBHOOK
+// 3) Telegram webhook
 // ──────────────────────────────────────────────────────────────────────────────
 app.get(`/telegram/${WEBHOOK_SECRET}`, (req, res) => {
-  res.json({ ok: true, via: "GET", expected: `/telegram/${WEBHOOK_SECRET}` });
+  res.json({ ok:true, via:"GET", expected:`/telegram/${WEBHOOK_SECRET}` });
 });
 
 app.post(`/telegram/${WEBHOOK_SECRET}`, async (req, res) => {
   try {
     const update = req.body;
     const msg = update?.message || update?.edited_message || update?.channel_post;
-    if (!msg) return res.status(200).json({ ok: true });
+    if (!msg) return res.status(200).json({ ok:true });
 
     const chatId = msg.chat.id;
     const text = msg.text || msg.caption || "";
     if (!text) {
       await tgSend(chatId, "Пока обрабатываю только текст.");
-      return res.status(200).json({ ok: true });
+      return res.status(200).json({ ok:true });
     }
 
     const answer = await smartReply(`tg:${chatId}`, "telegram", text, "ru");
     await tgSendAny(chatId, answer);
 
-    // Telegram всегда ждёт 200, иначе будет слать дубликаты
-    res.status(200).json({ ok: true });
+    res.status(200).json({ ok:true });
   } catch (e) {
     console.error("Telegram webhook error", e);
-    res.status(200).json({ ok: true });
+    // всегда 200, иначе Telegram будет ретраить
+    res.status(200).json({ ok:true });
   }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 4) ЗАПУСК
+// 4) RUN
 // ──────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`▶ RenovoGo Bot listening on :${PORT}`);
