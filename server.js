@@ -1,5 +1,5 @@
 // server.js — RenovoGo backend (health, actions, chat, dedupe, classify, answer_on, restart)
-// v2025-09-18-3
+// v2025-09-18-4
 
 import 'dotenv/config';
 import express from 'express';
@@ -102,11 +102,11 @@ const ActionClassify = CommonEnvelope.extend({
 
 const ActionAnswerOn = CommonEnvelope.extend({
   action: z.literal('answer_on'),
-  label: z.string().min(1),          // например: "дорого"
-  context: z.string().optional().default(''), // опционально — свежий контекст диалога
+  label: z.string().min(1),
+  context: z.string().optional().default(''),
   messages: z.array(Msg).optional(),
   session: SessionSchema,
-  examples: z.array(ExampleItem).optional().default([]) // сюда index.php кладёт кейсы категории
+  examples: z.array(ExampleItem).optional().default([])
 });
 
 const ActionControl = CommonEnvelope.extend({
@@ -115,15 +115,13 @@ const ActionControl = CommonEnvelope.extend({
   chat_id: z.string().optional()
 });
 
-// Новый формат чата
 const ChatPayloadNew = CommonEnvelope.extend({
   messages: z.array(Msg),
   session: SessionSchema,
   examples: z.array(ExampleItem).optional().default([]),
-  language: z.string().optional() // по умолчанию ru
+  language: z.string().optional()
 });
 
-// Старый формат (совместимость)
 const ChatPayloadLegacy = CommonEnvelope.extend({
   message: z.string().min(1),
   history: z.array(Msg).optional().default([]),
@@ -142,7 +140,7 @@ const BodySchema = z.union([
 ]);
 
 /* ──────────────────────────────────────────────────────────────
-   ЧАСТЬ 3. УТИЛИТЫ: модель, история, LLM, хэши
+   ЧАСТЬ 3. УТИЛИТЫ
    ────────────────────────────────────────────────────────────── */
 
 function pickModel(mode) {
@@ -181,18 +179,12 @@ async function runLLM({ model, messages, temperature = TEMPERATURE, top_p = TOP_
   }
 }
 
-function sha1(s) {
-  // лёгкий sha1-полифилл не нужен: используем key по сути как строку, цель — кэшировать, не шифровать
-  // для простоты «хэш» = первые 64 символа исходной строки (достаточно для анти-повторов)
-  return String(s).slice(0, 64);
-}
-
 /* ──────────────────────────────────────────────────────────────
-   ЧАСТЬ 4. СИСТЕМНЫЙ ПРОМПТ И ШАБЛОНЫ
+   ЧАСТЬ 4. ПРОМПТЫ
    ────────────────────────────────────────────────────────────── */
 
 function makeSystemPrompt({ language, session, examples }) {
-  const lang = language || 'ru'; // по умолчанию RU, чтобы не «уплывал» в EN
+  const lang = language || 'ru';
   const lines = [SYSTEM_PROMPT];
 
   if (session?.persona) lines.push(`\nПерсона: ${session.persona}`);
@@ -203,7 +195,7 @@ function makeSystemPrompt({ language, session, examples }) {
   if (Array.isArray(examples) && examples.length > 0) {
     const filtered = examples.filter(e => e.tag === 'would_answer').slice(0, 12);
     if (filtered.length) {
-      lines.push(`\nПримеры стиля (would_answer) — ориентир по тону и структуре (без дословных копий):`);
+      lines.push(`\nПримеры стиля (would_answer) — ориентир по тону и структуре:`);
       for (const ex of filtered) lines.push(`— ${ex.content}`);
     }
   }
@@ -213,65 +205,53 @@ function makeSystemPrompt({ language, session, examples }) {
 
 function promptTranslate(tgt, src, text) {
   return `Задача: сделай один законченный ответ на ${tgt.toUpperCase()} из текста на ${src.toUpperCase()}.
-Стиль: деловой и человечный WhatsApp, нейрокопирайтинг (ясность, выгоды, мягкое снятие рисков, микро-CTA при уместности), без воды.
-Формат: только итоговый текст на ${tgt.toUpperCase()} — без пояснений, без второй версии, без постскриптумов.
+Стиль: деловой и человечный WhatsApp, нейрокопирайтинг (ясность, выгоды, снятие рисков, микро-CTA), без воды.
+Формат: только итоговый текст на ${tgt.toUpperCase()} — без пояснений.
 Текст:
 ${text}`;
 }
-
 function promptRuEcho(tgtText, tgtLang) {
   return `Сделай аккуратную русскую версию текста (${tgtLang.toUpperCase()} → RU), не дословный бэктранслейт.
-Смысл и структура сохраняются, стиль деловой и лаконичный, без пояснений.
+Стиль деловой и лаконичный, без пояснений.
 Текст:
 ${tgtText}`;
 }
-
 function promptRecompose(text, opts) {
   const { psychology = true, neurocopy = true, cta_micro = true } = opts || {};
   return `Пересобери текст в краткий, продающий ответ для B2B-переписки (WhatsApp/Telegram).
-${psychology ? '— Используй мягкие психологические триггеры: уверенность, снятие рисков, социальное доказательство.' : ''}
-${neurocopy ? '— Нейрокопирайтинг: конкретика, выгоды, фокус на следующем шаге.' : ''}
-${cta_micro ? '— Заверши микро-CTA одной короткой фразой.' : ''}
+${psychology ? '— Используй уверенный тон и мягкие триггеры.' : ''}
+${neurocopy ? '— Конкретика и выгоды, без воды.' : ''}
+${cta_micro ? '— Заверши микро-CTA.' : ''}
 
-Требования:
-- Короткие абзацы, грамотная пунктуация, без вступлений вроде «вот ваш текст».
 Исходник:
 ${text}`;
 }
-
 function promptClassify(text, labels, k) {
   return `Классифицируй сообщение по списку меток и верни ${k} самых релевантных.
 Метки: ${labels.join(', ')}
 Текст: ${text}
-
-Формат ответа:
-label1, label2, label3`;
+Формат: label1, label2, label3`;
 }
-
 function promptAnswerFromCategory(label, examples, context) {
   const lines = [];
-  lines.push(`Используй подходящие кейсы этой категории, адаптируй под контекст и дай один готовый ответ.`);
+  lines.push(`Сформируй один готовый ответ по категории.`);
   lines.push(`Категория: ${label}`);
   if (context) lines.push(`Контекст: ${context}`);
   if (examples.length) {
-    lines.push(`Кейсы категории (примеры, не копируй дословно):`);
-    for (const ex of examples.slice(0, 8)) {
-      lines.push(`— ${ex.content}`);
-    }
+    lines.push(`Кейсы (не копируй дословно):`);
+    for (const ex of examples.slice(0, 8)) lines.push(`— ${ex.content}`);
   } else {
-    lines.push(`Кейсов нет — сгенерируй аккуратный шаблон по категории.`);
+    lines.push(`Кейсов нет — сгенерируй внятный шаблон по категории.`);
   }
-  lines.push(`Требования: кратко, по делу, деловой человечный тон, без преамбул и пояснений, один ответ.`);
-
+  lines.push(`Требования: кратко, по делу, деловой тон, один ответ без пояснений.`);
   return lines.join('\n');
 }
 
 /* ──────────────────────────────────────────────────────────────
-   ЧАСТЬ 5. КЭШИ АНТИ-ПОВТОРОВ И RESTART
+   ЧАСТЬ 5. АНТИ-ПОВТОРЫ (ослаблено)
    ────────────────────────────────────────────────────────────── */
 
-// Анти-дуп по ключу (ретраи клиента/телеграма)
-const dupeCache = new Map(); // key -> timestamp
+const dupeCache = new Map();      // dedupe_key → ts
 const DUPE_TTL_MS = 30_000;
 
 function isDuplicate(key) {
@@ -284,29 +264,27 @@ function isDuplicate(key) {
   return false;
 }
 
-// Анти-«зацикливание» по содержимому
-const recentByChat = new Map(); // chat_id -> { lastHash, count, ts }
-const REPEAT_TTL_MS = 5 * 60_000; // 5 минут
-const REPEAT_MAX = 2; // если один и тот же текст прилетает чаще — режем
+// мягкое подавление одинаковых payload’ов (кроме chat_new и answer_on)
+const recentByChat = new Map(); // chat_id -> { lastKey, count, ts }
+const REPEAT_TTL_MS = 120_000;  // 2 минуты
+const REPEAT_MAX    = 8;        // допускаем до 8 повторов
 
-function isRepeatSuppressed(chat_id, text) {
-  if (!chat_id || !text) return false;
+function shouldSuppress(chat_id, key, { allow } = { allow: [] }) {
+  if (!chat_id || !key) return false;
+  if (allow.includes('always')) return false;
+
   const now = Date.now();
-  const key = String(chat_id);
-  const h = sha1(text);
-  const cur = recentByChat.get(key);
-  if (!cur || (now - cur.ts) > REPEAT_TTL_MS) {
-    recentByChat.set(key, { lastHash: h, count: 1, ts: now });
+  const cur = recentByChat.get(chat_id) || { lastKey: '', count: 0, ts: 0 };
+  if ((now - cur.ts) > REPEAT_TTL_MS) {
+    recentByChat.set(chat_id, { lastKey: key, count: 1, ts: now });
     return false;
   }
-  if (cur.lastHash === h) {
-    cur.count += 1; cur.ts = now;
-    recentByChat.set(key, cur);
+  if (cur.lastKey === key) {
+    cur.count += 1; cur.ts = now; recentByChat.set(chat_id, cur);
     return cur.count > REPEAT_MAX;
-  } else {
-    recentByChat.set(key, { lastHash: h, count: 1, ts: now });
-    return false;
   }
+  recentByChat.set(chat_id, { lastKey: key, count: 1, ts: now });
+  return false;
 }
 
 function hardRestart(chat_id) {
@@ -328,12 +306,12 @@ async function handleTranslate(body) {
     messages = [],
     session = {},
     examples = [],
-    chat_id
+    chat_id = ''
   } = body;
 
-  // защита от «один и тот же текст 100 раз»
-  if (isRepeatSuppressed(chat_id, `translate|${src_lang}|${tgt_lang}|${text}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
+  const suppressKey = `translate|${src_lang}|${tgt_lang}|${text}`;
+  if (shouldSuppress(chat_id, suppressKey)) {
+    return { ok: true, model: MODEL_PRIMARY, reply: 'Повтор того же запроса. Вот готовый вариант на прошлой версии ответа:\n' + text };
   }
 
   const model = pickModel(mode);
@@ -362,10 +340,11 @@ async function handleTranslate(body) {
 }
 
 async function handleRewriteRu(body) {
-  const { mode, text, messages = [], session = {}, examples = [], note = '', chat_id } = body;
+  const { mode, text, messages = [], session = {}, examples = [], note = '', chat_id = '' } = body;
 
-  if (isRepeatSuppressed(chat_id, `rewrite_ru|${text}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
+  const suppressKey = `rewrite_ru|${text}`;
+  if (shouldSuppress(chat_id, suppressKey)) {
+    return { ok: true, model: MODEL_PRIMARY, reply: text };
   }
 
   const model = pickModel(mode);
@@ -382,10 +361,11 @@ async function handleRewriteRu(body) {
 }
 
 async function handleRecomposeSales(body) {
-  const { mode, text, hints = {}, messages = [], session = {}, examples = [], chat_id } = body;
+  const { mode, text, hints = {}, messages = [], session = {}, examples = [], chat_id = '' } = body;
 
-  if (isRepeatSuppressed(chat_id, `recompose|${text}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
+  const suppressKey = `recompose|${text}`;
+  if (shouldSuppress(chat_id, suppressKey)) {
+    return { ok: true, model: MODEL_PRIMARY, reply: text };
   }
 
   const model = pickModel(mode);
@@ -402,10 +382,11 @@ async function handleRecomposeSales(body) {
 }
 
 async function handleClassify(body) {
-  const { mode, text, labels, top_k, messages = [], session = {}, examples = [], chat_id } = body;
+  const { mode, text, labels, top_k, messages = [], session = {}, examples = [], chat_id = '' } = body;
 
-  if (isRepeatSuppressed(chat_id, `classify|${text}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
+  const suppressKey = `classify|${text}`;
+  if (shouldSuppress(chat_id, suppressKey)) {
+    return { ok: true, model: MODEL_PRIMARY, reply: labels.slice(0, top_k) };
   }
 
   const model = pickModel(mode);
@@ -426,25 +407,20 @@ async function handleClassify(body) {
 }
 
 async function handleAnswerOn(body) {
-  const { mode, label, context = '', messages = [], session = {}, examples = [], chat_id } = body;
+  const { mode, label, context = '', messages = [], session = {}, examples = [], chat_id = '' } = body;
 
-  if (isRepeatSuppressed(chat_id, `answer_on|${label}|${context}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
-    }
-
+  // ВАЖНО: НЕ подавляем для answer_on
   const model = pickModel(mode);
   const sys = makeSystemPrompt({ language: 'ru', session, examples });
 
-  // отфильтруем кейсы своей категории, которые пришли в payload.examples
   const tag = 'category:' + label.toLowerCase();
-  const catExamples = (examples || []).filter(e => e.tag.toLowerCase() === tag);
+  const catExamples = (examples || []).filter(e => (e.tag || '').toLowerCase() === tag);
 
   const msgs = [
     { role: 'system', content: sys },
     ...truncateHistory(messages),
     { role: 'user', content: promptAnswerFromCategory(label, catExamples, context) }
   ];
-
   const r = await runLLM({ model, messages: msgs });
   if (!r.ok) return r;
   return { ok: true, model: r.model, reply: r.text };
@@ -457,16 +433,13 @@ function handleControlRestart(body) {
 }
 
 /* ──────────────────────────────────────────────────────────────
-   ЧАСТЬ 7. ЧАТ (НОВЫЙ И СТАРЫЙ)
+   ЧАСТЬ 7. ЧАТ
    ────────────────────────────────────────────────────────────── */
 
 async function handleChatNew(body) {
-  const { mode, messages, session = {}, examples = [], language, chat_id } = body;
+  const { mode, messages, session = {}, examples = [], language } = body;
 
-  if (isRepeatSuppressed(chat_id, `chat_new|${messages?.[messages.length-1]?.content || ''}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
-  }
-
+  // ВАЖНО: НЕ подавляем для обычного диалога
   const model = pickModel(mode);
   const sys = makeSystemPrompt({ language, session, examples });
 
@@ -477,12 +450,9 @@ async function handleChatNew(body) {
 }
 
 async function handleChatLegacy(body) {
-  const { mode, message, history = [], language, chat_id } = body;
+  const { mode, message, history = [], language } = body;
 
-  if (isRepeatSuppressed(chat_id, `chat_legacy|${message}`)) {
-    return { ok: false, error: 'repeat_suppressed' };
-  }
-
+  // ВАЖНО: НЕ подавляем для обычного диалога
   const model = pickModel(mode);
   const sys = SYSTEM_PROMPT + `\nОтвечай на языке: ${language || 'ru'}`;
 
@@ -505,7 +475,7 @@ app.get('/health', (_, res) => res.json({ ok: true, model: MODEL_PRIMARY }));
 app.get('/api/ping', (_, res) => res.json({ ok: true, ts: Date.now(), model: MODEL_PRIMARY }));
 
 app.post('/api/reply', async (req, res) => {
-  // Анти-дубликаты по dedupe_key
+  // анти-дубликаты по dedupe_key
   const dedupeKey = req.body?.dedupe_key;
   if (isDuplicate(dedupeKey)) {
     return res.status(409).json({ ok: false, error: 'duplicate', dedupe_key: dedupeKey });
@@ -523,27 +493,27 @@ app.post('/api/reply', async (req, res) => {
       switch (body.action) {
         case 'translate': {
           const r = await handleTranslate(body);
-          if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+          if (!r.ok) return res.status(500).json(r);
           return res.json({ ok: true, model: r.model, reply: r.reply, ru_echo: r.ru_echo });
         }
         case 'rewrite_ru': {
           const r = await handleRewriteRu(body);
-          if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+          if (!r.ok) return res.status(500).json(r);
           return res.json({ ok: true, model: r.model, reply: r.reply });
         }
         case 'recompose_sales': {
           const r = await handleRecomposeSales(body);
-          if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+          if (!r.ok) return res.status(500).json(r);
           return res.json({ ok: true, model: r.model, reply: r.reply });
         }
         case 'classify': {
           const r = await handleClassify(body);
-          if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+          if (!r.ok) return res.status(500).json(r);
           return res.json({ ok: true, model: r.model, labels: r.reply });
         }
         case 'answer_on': {
           const r = await handleAnswerOn(body);
-          if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+          if (!r.ok) return res.status(500).json(r);
           return res.json({ ok: true, model: r.model, reply: r.reply });
         }
         case 'control': {
@@ -557,12 +527,12 @@ app.post('/api/reply', async (req, res) => {
 
     if ('messages' in body) {
       const r = await handleChatNew(body);
-      if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+      if (!r.ok) return res.status(500).json(r);
       return res.json({ ok: true, model: r.model, reply: r.reply });
     }
 
     const r = await handleChatLegacy(body);
-    if (!r.ok) return res.status(r.error === 'repeat_suppressed' ? 429 : 500).json(r);
+    if (!r.ok) return res.status(500).json(r);
     return res.json({ ok: true, model: r.model, reply: r.reply });
 
   } catch (err) {
