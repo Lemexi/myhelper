@@ -2,29 +2,17 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ── Маппинг слов/флагов → коды ── */
-const FlagMap = {
-  "🇬🇧": "en", "🇺🇸": "en", "🇨🇦": "en",
-  "🇵🇱": "pl",
-  "🇺🇦": "uk",
-  "🇷🇺": "ru",
-  "🇨🇿": "cz", "🇨🇭": "cz"
-};
-
+/* ── Маппинг слов → коды ── */
 const LangMap = {
-  "английский": "en", "англ": "en", "на англ": "en", english: "en", eng: "en", en: "en",
-  "чешский": "cz", "чеськ": "cz", "чеш": "cz", "на чеш": "cz", czech: "cz", cz: "cz", cs: "cz",
-  "польский": "pl", "польск": "pl", "на пол": "pl", polish: "pl", pl: "pl",
-  "украинский": "uk", "укр": "uk", "на укр": "uk", "українською": "uk", ukrainian: "uk", uk: "uk",
-  "русский": "ru", "рус": "ru", "на рус": "ru", "російською": "ru", russian: "ru", ru: "ru",
+  "английский": "en", english: "en", eng: "en", en: "en",
+  "чешский": "cz", czech: "cz", cz: "cz", cs: "cz",
+  "польский": "pl", polish: "pl", pl: "pl",
+  "украинский": "uk", ukrainian: "uk", uk: "uk",
+  "русский": "ru", russian: "ru", ru: "ru",
 };
-
 export function resolveTargetLangCode(word) {
   if (!word) return null;
-  const key = (word || "").toLowerCase().trim();
-  if (FlagMap[word]) return FlagMap[word];
-  const flag = [...word].find(ch => FlagMap[ch]);
-  if (flag) return FlagMap[flag];
+  const key = (word || "").toLowerCase();
   return LangMap[key] || null;
 }
 
@@ -32,7 +20,7 @@ export function resolveTargetLangCode(word) {
 export async function detectLanguage(text) {
   const { text: out } = await runLLM([
     { role: "system", content: "Detect language code among: en,ru,uk,pl,cz. Output only the code." },
-    { role: "user", content: (text || "").slice(0, 500) }
+    { role: "user", content: text.slice(0, 500) }
   ], { max_tokens: 5 });
   const code = (out || "en").trim().toLowerCase();
   return ["en","ru","uk","pl","cz"].includes(code) ? code : "en";
@@ -73,33 +61,38 @@ export async function toEnglishCanonical(text) {
   return { canonical, sourceLang: src, original: text };
 }
 
-/* ── Перевод с «усилением»: B2B-переписка, влияние/маркетинг ── */
+/* ── Перевод с «усилением»: целевой + RU; опциональная альтернатива ── */
 export async function translateWithStyle({ sourceText, targetLang }) {
   const target = (targetLang || "en").toLowerCase();
 
-  const { text: styledRaw } = await runLLM([
+  // Основной вариант (строго без пояснений)
+  const { text: styled } = await runLLM([
     {
       role: "system",
       content:
-        // ВАЖНО: стиль, влияние, копирайтинг, CTA — всё жёстко в промпте
-        "You are a senior B2B copywriter for WhatsApp/Email. Rewrite the user's message in the TARGET language.\n" +
-        "Goals: high clarity, credibility, warmth; persuasive but ethical; subtle Cialdini (1–2 cues max);\n" +
-        "use neuromarketing micro-cues, concrete benefits, and a soft CTA if natural.\n" +
-        "Constraints: 1–4 short sentences, no fluff, no headers, no quotes, no labels, no explanations.\n" +
-        "Output ONLY the rewritten text in the target language."
+        "Rewrite for B2B WhatsApp: 1–4 short sentences, confident, warm, persuasive but ethical; soft Cialdini (max 1–2). " +
+        "Output ONLY the rewritten text in the target language. No headings, no quotes, no explanations."
     },
-    { role: "user", content: `TARGET=${target}\nTEXT:\n${sourceText}` }
+    { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // На всякий случай подчистим возможные «Translation: …»
-  let styled = (styledRaw || "").trim();
-  styled = styled.replace(/^(english translation|translation|перевод)\s*:\s*/i, "").trim();
-  if ((styled.startsWith('"') && styled.endsWith('"')) || (styled.startsWith('“') && styled.endsWith('”'))) {
-    styled = styled.slice(1, -1).trim();
-  }
+  // Альтернативный вариант (может вернуть пустую строку — тогда его нет)
+  const { text: altMaybe } = await runLLM([
+    {
+      role: "system",
+      content:
+        "Provide ONE alternative rephrase of the user's text in the same target language. " +
+        "Keep 1–4 sentences, same constraints. If the original is already optimal, return exactly an empty string. " +
+        "Output only the alternative text (or empty string)."
+    },
+    { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
+  ]);
 
-  // Русская версия-подсказка (если надо где-то показать)
-  const styledRu = target === "ru" ? styled : (await translateCached(styled, target, "ru")).text;
+  // Русские версии
+  const styledRu   = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
+  const altClean   = (altMaybe || "").trim();
+  const altStyled  = altClean ? altClean : "";
+  const altStyledRu = altStyled ? (target === "ru" ? altStyled : (await translateCached(altStyled, target, "ru")).text) : "";
 
-  return { targetLang: target, styled, styledRu, altStyled: "", altStyledRu: "" };
+  return { targetLang: target, styled, styledRu, altStyled, altStyledRu };
 }
