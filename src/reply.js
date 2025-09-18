@@ -2,7 +2,9 @@
 import { SYSTEM_PROMPT } from "./prompt.js";
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
-  loadLatestSummary, logReply, getLastAuditCategory, getSession
+  loadLatestSummary, logReply, getLastAuditCategory, getSession,
+  // QnA helpers:
+  qnaFind, qnaTouchUse, getLastAssistantMessage, qnaInsert
 } from "./db.js";
 import { kbFind, kbInsertAnswer } from "./kb.js";
 import {
@@ -13,7 +15,8 @@ import {
   classifyCategory, detectAnyName, detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
-  isCmdAnswerExpensive, extractGreeting, stripQuoted
+  isCmdAnswerExpensive, extractGreeting, stripQuoted,
+  norm
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
@@ -56,8 +59,19 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
 
   const { targetLang: tgt, styled, styledRu } = await translateWithStyle({ sourceText: text, targetLang });
 
-  // Отдаём ДВА блока, всегда:
-  // 1) Целевая версия для клиента; 2) Для тебя (RU)
+  // Сохраняем как QnA по исходной фразе (чтобы в следующий раз отдать готовый стиль)
+  const { canonical: qCanonEN } = await toEnglishCanonical(text);
+  const qNormEN = norm((qCanonEN || "").toLowerCase());
+  await qnaInsert({
+    lang: tgt,
+    questionNormEn: qNormEN,
+    questionRaw: text,
+    answerText: styled,
+    source: "translate",
+    sessionId
+  });
+
+  // Отдаём ДВА блока:
   const combined =
     `🔁 Перевод (${tgt.toUpperCase()}):\n` +
     `${styled}\n\n` +
@@ -79,11 +93,30 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
     await saveMessage(sessionId, "assistant", canonical, { category: "teach", strategy: "cmd_teach_error" }, "en", userLang, msg, "teach");
     return msg;
   }
+
+  // Привязываем к ПОСЛЕДНЕМУ сообщению ассистента
+  const lastA = await getLastAssistantMessage(sessionId);
+  const baseQuestion = lastA?.translated_content || lastA?.content || "";
+  const { canonical: qCanonEN } = await toEnglishCanonical(baseQuestion || "");
+  const qNormEN = norm((qCanonEN || "").toLowerCase());
+
+  // Пишем в QnA (приоритетная база для быстрых ответов)
+  const qnaId = await qnaInsert({
+    lang: userLang,
+    questionNormEn: qNormEN,
+    questionRaw: baseQuestion,
+    answerText: taught,
+    source: "teach",
+    sessionId
+  });
+
+  // (опционально) дублируем в KB по последней категории — как у тебя было
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
-  const out = `✅ В базу добавлено.\n\n${taught}`;
+
+  const out = `✅ Запомнил ответ на последний вопрос. Теперь буду отвечать так:\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
-  await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId }, "en", userLang, out, lastCat);
+  await saveMessage(sessionId, "assistant", canonical, { category: lastCat, strategy: "cmd_teach", kb_id: kbId, qna_id: qnaId }, "en", userLang, out, lastCat);
   return out;
 }
 
@@ -155,7 +188,19 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // 4) Классификация → KB → перевод → LLM
+  // 4) QnA поверх всего (до KB/LLM)
+  const qNormEN = norm((userTextEN || "").toLowerCase());
+  const qnaHit = await qnaFind(userLang, qNormEN);
+  if (qnaHit) {
+    const answer = qnaHit.answer_text;
+    const { canonical: ansEN } = await toEnglishCanonical(answer);
+    await saveMessage(sessionId, "assistant", ansEN, { category: "qna", strategy: "kb_qna" }, "en", userLang, answer, "qna");
+    await qnaTouchUse(qnaHit.id);
+    await logReply(sessionId, "kb_qna", "qna", null, userMsgId, "hit by norm EN");
+    return answer;
+  }
+
+  // 5) Классификация → KB → перевод → LLM
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, userLang);
