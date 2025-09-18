@@ -19,7 +19,7 @@ export function resolveTargetLangCode(word) {
 /* ── Детект языка ── */
 export async function detectLanguage(text) {
   const { text: out } = await runLLM([
-    { role: "system", content: "Detect language code (en,ru,uk,pl,cz). Output only the code." },
+    { role: "system", content: "Detect language code among: en,ru,uk,pl,cz. Output only the code." },
     { role: "user", content: text.slice(0, 500) }
   ], { max_tokens: 5 });
   const code = (out || "en").trim().toLowerCase();
@@ -40,8 +40,8 @@ export async function translateCached(text, sourceLang, targetLang) {
   if (hit.rows.length) return { text: hit.rows[0].translated_text, cached: true };
 
   const { text: translated } = await runLLM([
-    { role: "system", content: "You are a professional translator. Translate preserving meaning and tone." },
-    { role: "user", content: `Translate from ${sourceLang} to ${targetLang}: ${text}` }
+    { role: "system", content: "Translate faithfully with natural style. Output only the translated sentence(s), no explanations." },
+    { role: "user", content: `Translate from ${sourceLang} to ${targetLang}:\n${text}` }
   ]);
 
   const ins = `
@@ -61,24 +61,38 @@ export async function toEnglishCanonical(text) {
   return { canonical, sourceLang: src, original: text };
 }
 
-/* ── Перевод с «усилением»: целевой + RU для менеджера ── */
+/* ── Перевод с «усилением»: целевой + RU; опциональная альтернатива ── */
 export async function translateWithStyle({ sourceText, targetLang }) {
-  const target = targetLang || "en";
+  const target = (targetLang || "en").toLowerCase();
 
-  // 1) Перепишем текст под WhatsApp B2B в целевом языке
+  // Основной вариант (строго без пояснений)
   const { text: styled } = await runLLM([
-    { role: "system", content: "Rewrite for B2B WhatsApp: brief (1–4 sentences), confident, helpful, persuasive but ethical. Use at most 1–2 soft Cialdini principles. Output only the rewritten text in the target language." },
-    { role: "user", content: `Target language: ${target}. Text:\n${sourceText}` }
+    {
+      role: "system",
+      content:
+        "Rewrite for B2B WhatsApp: 1–4 short sentences, confident, warm, persuasive but ethical; soft Cialdini (max 1–2). " +
+        "Output ONLY the rewritten text in the target language. No headings, no quotes, no explanations."
+    },
+    { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
   ]);
 
-  // 2) Версия для менеджера на русском (перевод из целевого языка)
-  let styledRu;
-  if (target === "ru") {
-    styledRu = styled;
-  } else {
-    const { text: ru } = await translateCached(styled, target, "ru");
-    styledRu = ru;
-  }
+  // Альтернативный вариант (может вернуть пустую строку — тогда его нет)
+  const { text: altMaybe } = await runLLM([
+    {
+      role: "system",
+      content:
+        "Provide ONE alternative rephrase of the user's text in the same target language. " +
+        "Keep 1–4 sentences, same constraints. If the original is already optimal, return exactly an empty string. " +
+        "Output only the alternative text (or empty string)."
+    },
+    { role: "user", content: `Target: ${target}\nText:\n${sourceText}` }
+  ]);
 
-  return { targetLang: target, styled, styledRu };
+  // Русские версии
+  const styledRu   = target === "ru" ? styled : (await translateCached(styled,   target, "ru")).text;
+  const altClean   = (altMaybe || "").trim();
+  const altStyled  = altClean ? altClean : "";
+  const altStyledRu = altStyled ? (target === "ru" ? altStyled : (await translateCached(altStyled, target, "ru")).text) : "";
+
+  return { targetLang: target, styled, styledRu, altStyled, altStyledRu };
 }
