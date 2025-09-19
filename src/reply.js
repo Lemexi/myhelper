@@ -31,6 +31,7 @@ import { saveUserQuestion, findAnswerFromKB } from "./qna.js";
  * ВСПОМОГАТЕЛЬНОЕ
  * ────────────────────────────────────────────────────────────*/
 
+// Персонификация коротких просьб
 function personaReply(persona, shortAnswer, cta) {
   const T = {
     commander: (ans, c) => `${ans ? ans + '\n' : ''}План: ${c || 'Страна, позиция, ставка — и двигаемся.'}`,
@@ -52,6 +53,42 @@ function buildAskName(userLang, rawText) {
     en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
   };
   return by[userLang] || by.en;
+}
+
+// ЯЗЫК: поддерживаем RU/PL/CS/EN. Иначе — EN.
+// Если пользователь просит другой (не понимает) — переключаемся;
+// если язык вне RU/PL/CS/EN — честно говорим, что используем переводчик.
+const SUPPORTED = new Set(['ru', 'pl', 'cs', 'en']);
+
+function normLang(l) {
+  if (!l) return 'en';
+  const s = l.toLowerCase();
+  if (s.startsWith('cz')) return 'cs';
+  if (s.startsWith('uk')) return 'uk';
+  return s.slice(0,2);
+}
+
+function chooseConvLang(sourceLang) {
+  const L = normLang(sourceLang);
+  return SUPPORTED.has(L) ? L : 'en';
+}
+
+function askSwitchLang(text) {
+  const t = (text || '').toLowerCase();
+  return /не понимаю|не понял|не поняла|can we speak|speak .*|можно на|переход.*на/i.test(t);
+}
+
+function extractRequestedLang(text) {
+  const t = (text || '').toLowerCase();
+  if (/рус|russian/i.test(t)) return 'ru';
+  if (/pol(?:ish|sku)?|po polsku/i.test(t)) return 'pl';
+  if (/czech|cesk|čes|po čes/i.test(t)) return 'cs';
+  if (/english|англ/i.test(t)) return 'en';
+  // любое другое — пробуем вытащить ISO-код (например, arabic/hebrew/etc.)
+  if (/arab|араб/i.test(t)) return 'ar';
+  if (/hebr|иврит/i.test(t)) return 'he';
+  if (/ukrain/i.test(t)) return 'uk';
+  return null;
 }
 
 async function llmFallbackReply(sessionId, userTextEN, lang, promptExtras = {}) {
@@ -272,16 +309,44 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   // 0) Канонизация
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
-  const userLang = srcLang || userLangHint;
+
+  // базовый язык диалога
+  let convLang = chooseConvLang(srcLang);
+
+  // если пользователь просит другой язык
+  if (askSwitchLang(userTextRaw)) {
+    const want = extractRequestedLang(userTextRaw);
+    if (want) {
+      // если RU/PL/CS/EN — просто переключаемся без предупреждений
+      if (SUPPORTED.has(want)) {
+        convLang = want;
+      } else {
+        // любой другой — переключаемся и честно говорим про переводчик
+        convLang = want;
+        const note =
+          convLang === 'ru' ? 'Переключаюсь. Я буду использовать переводчик, чтобы сохранить точность.'
+        : convLang === 'pl' ? 'Przełączam się. Użyję tłumacza, żeby zachować dokładność.'
+        : convLang === 'cs' ? 'Přepínám se. Pro přesnost použiji překladač.'
+        : 'Switching language. I will use a translator to keep it accurate.';
+        const { canonical } = await toEnglishCanonical(note);
+        await saveMessage(
+          sessionId, "assistant", canonical,
+          { category: "lang_switch", strategy: "translator_notice", to: convLang },
+          "en", convLang, note, "lang_switch"
+        );
+        return note;
+      }
+    }
+  }
 
   // 1) Команды
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "teach" },
-      "en", userLang, origText, null
+      "en", convLang, origText, null
     );
-    const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
+    const out = await handleCmdTeach(sessionId, userTextRaw, convLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
   }
@@ -292,9 +357,9 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       const msgId = await saveMessage(
         sessionId, "user", userTextEN,
         { kind: "cmd_detected", cmd: "translate" },
-        "en", userLang, origText, null
+        "en", convLang, origText, null
       );
-      const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
+      const out = await handleCmdTranslate(sessionId, userTextRaw, convLang);
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     }
@@ -304,9 +369,9 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "answer_expensive" },
-      "en", userLang, origText, null
+      "en", convLang, origText, null
     );
-    const out = await handleCmdAnswerExpensive(sessionId, userLang);
+    const out = await handleCmdAnswerExpensive(sessionId, convLang);
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
     return out;
   }
@@ -330,7 +395,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   // 3) Логи сообщения + QnA-трекинг
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
-    null, "en", userLang, origText, null
+    null, "en", convLang, origText, null
   );
   await saveUserQuestion(sessionId, userTextEN);
 
@@ -341,25 +406,25 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     const { asked, attempts } = await wasAsked(sessionId, 'user_name');
     if (!asked || attempts < 2) {
       const ask = (attempts === 0)
-        ? buildAskName(userLang, userTextRaw)
-        : buildAskName(userLang, userTextRaw).replace('Подскажите, пожалуйста,', 'Напомню, пожалуйста,');
+        ? buildAskName(convLang, userTextRaw)
+        : buildAskName(convLang, userTextRaw).replace('Подскажите, пожалуйста,', 'Напомню, пожалуйста,');
       const { canonical } = await toEnglishCanonical(ask);
       await saveMessage(
         sessionId, "assistant", canonical,
         { category: "ask_name", strategy: attempts === 0 ? "precheck_name" : "precheck_name_repeat" },
-        "en", userLang, ask, "ask_name"
+        "en", convLang, ask, "ask_name"
       );
       await setAsked(sessionId, 'user_name');
       return ask;
     }
-    const skip = userLang === 'ru'
+    const skip = convLang === 'ru'
       ? 'Если не хотите называть имя — не проблема. Давайте продолжим по делу.'
       : "If you prefer not to share your name, no problem. Let's continue.";
     const { canonical } = await toEnglishCanonical(skip);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "ask_name", strategy: "precheck_name_skip" },
-      "en", userLang, skip, "ask_name"
+      "en", convLang, skip, "ask_name"
     );
     return skip;
   }
@@ -371,13 +436,13 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   // 6) Оффтоп: авто и пр. — короткий ответ + возврат к делу
   if (/машин|автомобил|cars?/i.test(userTextRaw)) {
-    const short = (userLang === 'ru')
+    const short = (convLang === 'ru')
       ? 'Коротко: по машинам могу подсказать, но наш фокус — легальное трудоустройство. Вернёмся к кандидатам? Какая страна и ставка?'
       : 'Brief: I can comment on cars, but our focus is legal job placement. Back to candidates? Which country and salary?';
     const { canonical } = await toEnglishCanonical(short);
     await saveMessage(sessionId, 'assistant', canonical,
       { category: 'offtopic', strategy: 'brief_then_return' },
-      'en', userLang, short, 'offtopic');
+      'en', convLang, short, 'offtopic');
     return short;
   }
 
@@ -395,14 +460,14 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
     if (needAsk) {
       const short = need.length === 1 ? `Нужна: ${need[0]}` : `Нужно: ${need.join(', ')}`;
-      const cta = (userLang === 'ru')
+      const cta = (convLang === 'ru')
         ? 'Пришлите, пожалуйста, и я продолжу.'
         : 'Please send, and I will continue.';
       const text = personaReply(persona, short, cta);
       const { canonical } = await toEnglishCanonical(text);
       await saveMessage(sessionId, 'assistant', canonical,
         { category: 'collect_facts', strategy: `ask_${persona}`, fields: need },
-        'en', userLang, text, 'collect_facts');
+        'en', convLang, text, 'collect_facts');
       for (const f of need) await setAsked(sessionId, f);
       return text;
     }
@@ -424,6 +489,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     case 'process':
     case 'expensive':
     default:
-      return await routeByCategory({ category, sessionId, userLang, userTextEN, userMsgId });
+      return await routeByCategory({ category, sessionId, userLang: convLang, userTextEN, userMsgId });
   }
 }
