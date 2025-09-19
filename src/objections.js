@@ -1,9 +1,8 @@
-// objections.js
-import { db } from './db.js';
+// objections.js — варианты ответов на возражения из KB
+import { pool } from './db.js';
 
 export async function getObjectionReply(kind = 'price', variant = 'any') {
-  // ожидаем, что в kb_items.category='objections', lang='ru', question = 'price'
-  const { rows } = await db.query(`
+  const { rows } = await pool.query(`
     SELECT answer
     FROM public.kb_items
     WHERE category='objections' AND lang='ru' AND question=$1 AND is_active=true
