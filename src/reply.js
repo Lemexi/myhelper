@@ -1,5 +1,4 @@
 // /src/reply.js
-
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
   loadLatestSummary, logReply, getLastAuditCategory, getSession, pool
@@ -20,18 +19,20 @@ import {
 } from "./classifier.js";
 
 import { runLLM } from "./llm.js";
-
 import { buildSystemPrompt, buildMessages } from "./prompt.js";
 import { ensureName, upsertFacts, getSessionProfile } from "./memory.js";
 import { fetchRecentSummaries } from "./summaries.js";
 import { maybeUpdateStyle } from "./style.js";
 import { saveUserQuestion, findAnswerFromKB } from "./qna.js";
 
+// ▶ NEW: stage playbook
+import { DIRECT_LANGS, handleByStage } from "./playbook.js";
+
 /* ─────────────────────────────────────────────────────────────
- * ВСПОМОГАТЕЛЬНОЕ
+ * Helpers
  * ────────────────────────────────────────────────────────────*/
 
-// Персонификация коротких просьб
+// short persona-flavoured asks (RU text in CTA ok for RU; EN otherwise)
 function personaReply(persona, shortAnswer, cta) {
   const T = {
     commander: (ans, c) => `${ans ? ans + '\n' : ''}План: ${c || 'Страна, позиция, ставка — и двигаемся.'}`,
@@ -49,16 +50,14 @@ function buildAskName(userLang, rawText) {
     ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
     uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатися?`,
     pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
-    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
+    cs: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
     en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
   };
   return by[userLang] || by.en;
 }
 
-// ЯЗЫК: поддерживаем RU/PL/CS/EN. Иначе — EN.
-// Если пользователь просит другой (не понимает) — переключаемся;
-// если язык вне RU/PL/CS/EN — честно говорим, что используем переводчик.
-const SUPPORTED = new Set(['ru', 'pl', 'cs', 'en']);
+// language policy
+const SUPPORTED = new Set(DIRECT_LANGS); // ['en','ru','pl','cs']
 
 function normLang(l) {
   if (!l) return 'en';
@@ -67,28 +66,34 @@ function normLang(l) {
   if (s.startsWith('uk')) return 'uk';
   return s.slice(0,2);
 }
-
 function chooseConvLang(sourceLang) {
   const L = normLang(sourceLang);
   return SUPPORTED.has(L) ? L : 'en';
 }
-
 function askSwitchLang(text) {
   const t = (text || '').toLowerCase();
   return /не понимаю|не понял|не поняла|can we speak|speak .*|можно на|переход.*на/i.test(t);
 }
-
 function extractRequestedLang(text) {
   const t = (text || '').toLowerCase();
   if (/рус|russian/i.test(t)) return 'ru';
   if (/pol(?:ish|sku)?|po polsku/i.test(t)) return 'pl';
   if (/czech|cesk|čes|po čes/i.test(t)) return 'cs';
   if (/english|англ/i.test(t)) return 'en';
-  // любое другое — пробуем вытащить ISO-код (например, arabic/hebrew/etc.)
   if (/arab|араб/i.test(t)) return 'ar';
   if (/hebr|иврит/i.test(t)) return 'he';
   if (/ukrain/i.test(t)) return 'uk';
   return null;
+}
+
+// translate EN→convLang if needed; if output not EN, normalize to convLang
+async function finalizeOut(textEN, convLang) {
+  if (!textEN) return '';
+  if (convLang === 'en') return textEN;
+  const detected = await detectLanguage(textEN);
+  if (detected === convLang) return textEN;
+  const from = (detected && ['en','ru','pl','cs','uk'].includes(detected)) ? detected : 'en';
+  return (await translateCached(textEN, from, convLang)).text;
 }
 
 async function llmFallbackReply(sessionId, userTextEN, lang, promptExtras = {}) {
@@ -111,7 +116,7 @@ async function llmFallbackReply(sessionId, userTextEN, lang, promptExtras = {}) 
       psychotype: profile?.psychotype,
       ...promptExtras
     },
-    locale: lang
+    locale: 'en' // держим системку на EN
   });
 
   const msgs = buildMessages({ system, userText: userTextEN });
@@ -121,9 +126,8 @@ async function llmFallbackReply(sessionId, userTextEN, lang, promptExtras = {}) 
 }
 
 /* ─────────────────────────────────────────────────────────────
- * УЧЁТ «ЧТО УЖЕ СПРАШИВАЛИ» (anti-repeat)
+ * Anti-repeat: asked_fields / asked_attempts
  * ────────────────────────────────────────────────────────────*/
-
 async function getAskedState(sessionId) {
   const { rows } = await pool.query(
     `SELECT asked_fields, asked_attempts FROM public.sessions WHERE id=$1`,
@@ -135,7 +139,6 @@ async function getAskedState(sessionId) {
     attempts: s.asked_attempts || {}
   };
 }
-
 async function setAsked(sessionId, field) {
   const { fields, attempts } = await getAskedState(sessionId);
   const nextFields = { ...fields, [field]: true };
@@ -149,16 +152,14 @@ async function setAsked(sessionId, field) {
     [sessionId, nextFields, nextAttempts]
   );
 }
-
 async function wasAsked(sessionId, field) {
   const { fields, attempts } = await getAskedState(sessionId);
   return { asked: !!fields[field], attempts: attempts[field] || 0 };
 }
 
 /* ─────────────────────────────────────────────────────────────
- * КОМАНДЫ
+ * Commands
  * ────────────────────────────────────────────────────────────*/
-
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord || "en").toLowerCase();
@@ -190,7 +191,6 @@ ${styledRu}`;
     { category: "translate", strategy: "cmd_translate" },
     "en", userLang, combined, "translate"
   );
-
   return combined;
 }
 
@@ -230,7 +230,7 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     answer = await llmFallbackReply(
       sessionId,
       "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA.",
-      userLang
+      'en'
     );
   }
   const { canonical } = await toEnglishCanonical(answer);
@@ -244,11 +244,9 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * КАТЕГОРИАЛЬНЫЙ РОУТЕР (KB exact → KB category → LLM)
+ * Category router (KB exact → KB category → LLM)
  * ────────────────────────────────────────────────────────────*/
-
 async function routeByCategory({ category, sessionId, userLang, userTextEN, userMsgId }) {
-  // 1) Точная база QnA (совпадение вопроса)
   const kbExact = await findAnswerFromKB(userTextEN, 0.9);
   if (kbExact) {
     const { canonical } = await toEnglishCanonical(kbExact);
@@ -261,7 +259,6 @@ async function routeByCategory({ category, sessionId, userLang, userTextEN, user
     return kbExact;
   }
 
-  // 2) Категорийная KB
   let kb = await kbFind(category, userLang);
   let answer = null;
   let strategy = "fallback_llm";
@@ -280,13 +277,9 @@ async function routeByCategory({ category, sessionId, userLang, userTextEN, user
     }
   }
 
-  // 3) LLM
   if (!answer) {
-    answer = await llmFallbackReply(sessionId, userTextEN, userLang);
-    const detected = await detectLanguage(answer);
-    if (detected && detected !== userLang) {
-      answer = (await translateCached(answer, detected, userLang)).text;
-    }
+    const draftEN = await llmFallbackReply(sessionId, userTextEN, 'en');
+    answer = await finalizeOut(draftEN, userLang);
   }
 
   const { canonical: ansEN } = await toEnglishCanonical(answer);
@@ -302,26 +295,23 @@ async function routeByCategory({ category, sessionId, userLang, userTextEN, user
 /* ─────────────────────────────────────────────────────────────
  * SMART REPLY
  * ────────────────────────────────────────────────────────────*/
-
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru", extra = {}) {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // 0) Канонизация
+  // normalize input to EN
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
 
-  // базовый язык диалога
+  // choose conversation language
   let convLang = chooseConvLang(srcLang);
 
-  // если пользователь просит другой язык
+  // explicit user ask to switch language
   if (askSwitchLang(userTextRaw)) {
     const want = extractRequestedLang(userTextRaw);
     if (want) {
-      // если RU/PL/CS/EN — просто переключаемся без предупреждений
       if (SUPPORTED.has(want)) {
         convLang = want;
       } else {
-        // любой другой — переключаемся и честно говорим про переводчик
         convLang = want;
         const note =
           convLang === 'ru' ? 'Переключаюсь. Я буду использовать переводчик, чтобы сохранить точность.'
@@ -339,7 +329,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   }
 
-  // 1) Команды
+  // Commands
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -350,7 +340,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
   }
-
   if (isCmdTranslate(userTextRaw)) {
     const { text: t } = parseCmdTranslate(userTextRaw);
     if (t && t.length >= 2) {
@@ -364,7 +353,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       return out;
     }
   }
-
   if (isCmdAnswerExpensive(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -376,7 +364,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // 2) Имя/контакт + факты
+  // Contact & quick facts
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
@@ -392,14 +380,14 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   if (num) facts.candidates_planned = Number(num);
   if (Object.keys(facts).length) await upsertFacts(sessionId, facts);
 
-  // 3) Логи сообщения + QnA-трекинг
+  // Log user message & QnA tracking
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
     null, "en", convLang, origText, null
   );
   await saveUserQuestion(sessionId, userTextEN);
 
-  // 4) Имя — спросим максимум 2 раза
+  // Ask name up to 2 times
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -429,12 +417,12 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return skip;
   }
 
-  // 5) Обновим стиль и возьмём психотип
+  // Style & persona
   await maybeUpdateStyle(sessionId);
   const profile = await getSessionProfile(sessionId);
   const persona = profile?.psychotype || 'default';
 
-  // 6) Оффтоп: авто и пр. — короткий ответ + возврат к делу
+  // Offtopic: cars
   if (/машин|автомобил|cars?/i.test(userTextRaw)) {
     const short = (convLang === 'ru')
       ? 'Коротко: по машинам могу подсказать, но наш фокус — легальное трудоустройство. Вернёмся к кандидатам? Какая страна и ставка?'
@@ -446,36 +434,28 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return short;
   }
 
-  // 7) Если критичных фактов нет — спросим ОДИН раз в стиле персоны
-  const need = [];
-  if (!profile?.country_interest) need.push('country');
-  if (!profile?.intent_main)      need.push('position');
-  if (!profile?.candidates_planned) need.push('candidates');
+  // ▶ NEW: Stage playbook first
+  const stageOut = await handleByStage({
+    sessionId,
+    userTextEN,
+    convLang,
+    persona
+  });
 
-  if (need.length) {
-    let needAsk = false;
-    for (const f of need) {
-      const { asked, attempts } = await wasAsked(sessionId, f);
-      if (!asked || attempts < 1) { needAsk = true; break; }
-    }
-    if (needAsk) {
-      const short = need.length === 1 ? `Нужна: ${need[0]}` : `Нужно: ${need.join(', ')}`;
-      const cta = (convLang === 'ru')
-        ? 'Пришлите, пожалуйста, и я продолжу.'
-        : 'Please send, and I will continue.';
-      const text = personaReply(persona, short, cta);
-      const { canonical } = await toEnglishCanonical(text);
-      await saveMessage(sessionId, 'assistant', canonical,
-        { category: 'collect_facts', strategy: `ask_${persona}`, fields: need },
-        'en', convLang, text, 'collect_facts');
-      for (const f of need) await setAsked(sessionId, f);
-      return text;
-    }
+  if (stageOut && stageOut.textEN) {
+    const final = await finalizeOut(stageOut.textEN, convLang);
+    const { canonical: ansEN } = await toEnglishCanonical(final);
+    await saveMessage(
+      sessionId, "assistant", ansEN,
+      { category: stageOut.stage || "stage", strategy: stageOut.strategy || "playbook" },
+      "en", convLang, final, stageOut.stage || "stage"
+    );
+    await logReply(sessionId, stageOut.strategy || "playbook", stageOut.stage || "stage", null, userMsgId, "playbook");
+    return final;
   }
 
-  // 8) Классификация → маршрутизация
+  // If playbook didn't produce output → category router
   const category = await classifyCategory(userTextRaw);
-
   switch (category) {
     case 'greeting':
     case 'smalltalk':
