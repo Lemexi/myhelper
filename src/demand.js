@@ -1,12 +1,13 @@
-// demand.js
-import { db } from './db.js';
+// demand.js — CRUD оффера (session_demand) + выбор контракта
+import { pool } from './db.js';
 
 export async function upsertDemand(sessionId, payload = {}) {
-  // деактивируем прошлый активный
-  await db.query(`UPDATE public.session_demand SET is_active=false, updated_at=NOW()
-                  WHERE session_id=$1 AND is_active=true`, [sessionId]);
+  await pool.query(
+    `UPDATE public.session_demand SET is_active=false, updated_at=NOW()
+     WHERE session_id=$1 AND is_active=true`, [sessionId]
+  );
 
-  const { rows } = await db.query(`
+  const { rows } = await pool.query(`
     INSERT INTO public.session_demand
       (session_id, country, company_name, position, location_city, visa_type,
        salary_min, salary_max, salary_currency, hours_per_month, schedule_text, period_months,
@@ -40,10 +41,11 @@ export async function upsertDemand(sessionId, payload = {}) {
 }
 
 export async function setSessionContract(sessionId, demandId, contractId, override = {}) {
-  // делаем один активный
-  await db.query(`UPDATE public.session_contract SET is_active=false, updated_at=NOW()
-                  WHERE session_id=$1 AND is_active=true`, [sessionId]);
-  await db.query(`
+  await pool.query(
+    `UPDATE public.session_contract SET is_active=false, updated_at=NOW()
+     WHERE session_id=$1 AND is_active=true`, [sessionId]
+  );
+  await pool.query(`
     INSERT INTO public.session_contract
       (session_id, demand_id, contract_id, price_override, currency_override, notes)
     VALUES ($1,$2,$3,$4,$5,$6)
