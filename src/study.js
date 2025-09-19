@@ -1,5 +1,5 @@
-// study.js
-import { db } from './db.js';
+// study.js — черновой каталог вакансий в kb_items(category='jobs')
+import { pool } from './db.js';
 
 export async function addJob({ title, country, city, salary, hours, notes }) {
   const q = `
@@ -8,12 +8,12 @@ export async function addJob({ title, country, city, salary, hours, notes }) {
     RETURNING id
   `;
   const text = JSON.stringify({ country, city, salary, hours, notes });
-  const { rows } = await db.query(q, [title, text]);
+  const { rows } = await pool.query(q, [title, text]);
   return rows[0].id;
 }
 
 export async function listJobs(limit=20) {
-  const { rows } = await db.query(`
+  const { rows } = await pool.query(`
     SELECT id, question AS title, answer
     FROM public.kb_items
     WHERE category='jobs' AND is_active=true
