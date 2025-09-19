@@ -1,4 +1,3 @@
-// /src/reply.js
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
   loadLatestSummary, logReply, getLastAuditCategory, getSession, pool
@@ -24,26 +23,13 @@ import { ensureName, upsertFacts, getSessionProfile } from "./memory.js";
 import { fetchRecentSummaries } from "./summaries.js";
 import { maybeUpdateStyle } from "./style.js";
 import { saveUserQuestion, findAnswerFromKB } from "./qna.js";
-import { DIRECT_LANGS, handleByStage, inferQuickFacts } from "./playbook.js";
 
-// ▶ Playbook (этапы диалога)
+// ▶ stage playbook
 import { DIRECT_LANGS, handleByStage } from "./playbook.js";
 
 /* ─────────────────────────────────────────────────────────────
  * Helpers
  * ────────────────────────────────────────────────────────────*/
-
-// короткие просьбы с оттенком персоны (RU/EN)
-function personaReply(persona, shortAnswer, cta) {
-  const T = {
-    commander: (ans, c) => `${ans ? ans + '\n' : ''}План: ${c || 'Страна, позиция, ставка — и двигаемся.'}`,
-    diplomat:  (ans, c) => `${ans ? ans + '\n' : ''}Точно и по делу: ${c || 'уточните страну/позицию/ставку.'}`,
-    humanist:  (ans, c) => `${ans ? 'Понимаю. ' + ans + '\n' : ''}Сделаю аккуратно — ${c || 'подскажите детали, продолжим.'}`,
-    star:      (ans, c) => `${ans ? ans + '\n' : ''}Коротко: ${c || 'страна и ставка — и вперёд.'}`,
-    default:   (ans, c) => `${ans ? ans + '\n' : ''}${c || 'Пожалуйста, страна, позиция и ставка.'}`
-  };
-  return (T[persona] || T.default)(shortAnswer, cta);
-}
 
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
@@ -57,7 +43,7 @@ function buildAskName(userLang, rawText) {
   return by[userLang] || by.en;
 }
 
-// Language policy: поддерживаем EN/RU/PL/CS; остальное — EN (или переключаемся по просьбе)
+// language policy
 const SUPPORTED = new Set(DIRECT_LANGS); // ['en','ru','pl','cs']
 
 function normLang(l) {
@@ -87,7 +73,7 @@ function extractRequestedLang(text) {
   return null;
 }
 
-// Перевод EN→convLang при выводе
+// translate EN→convLang if needed
 async function finalizeOut(textEN, convLang) {
   if (!textEN) return '';
   if (convLang === 'en') return textEN;
@@ -97,7 +83,7 @@ async function finalizeOut(textEN, convLang) {
   return (await translateCached(textEN, from, convLang)).text;
 }
 
-async function llmFallbackReply(sessionId, userTextEN, _lang, promptExtras = {}) {
+async function llmFallbackReply(sessionId, userTextEN) {
   const recentRaw = await loadRecentMessages(sessionId, 18);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -114,10 +100,9 @@ async function llmFallbackReply(sessionId, userTextEN, _lang, promptExtras = {})
       intent_main: profile?.intent_main,
       candidates_planned: profile?.candidates_planned,
       stage: profile?.stage,
-      psychotype: profile?.psychotype,
-      ...promptExtras
+      psychotype: profile?.psychotype
     },
-    locale: 'en' // системный всегда EN
+    locale: 'en'
   });
 
   const msgs = buildMessages({ system, userText: userTextEN });
@@ -127,7 +112,7 @@ async function llmFallbackReply(sessionId, userTextEN, _lang, promptExtras = {})
 }
 
 /* ─────────────────────────────────────────────────────────────
- * Anti-repeat (asked_fields / asked_attempts)
+ * Anti-repeat: asked_fields / asked_attempts
  * ────────────────────────────────────────────────────────────*/
 async function getAskedState(sessionId) {
   const { rows } = await pool.query(
@@ -180,10 +165,10 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     await translateWithStyle({ sourceText: text, targetLang });
 
   const combined =
-`🔍 Перевод (${tgt.toUpperCase()}):
+`Перевод (${tgt.toUpperCase()}):
 ${styled}
 
-💬 Для тебя (RU):
+Для тебя (RU):
 ${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
@@ -210,7 +195,7 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
   const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
 
-  const out = `✅ В базу добавлено.\n\n${taught}`;
+  const out = `В базу добавлено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(
     sessionId, "assistant", canonical,
@@ -230,8 +215,7 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   } else {
     answer = await llmFallbackReply(
       sessionId,
-      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA.",
-      'en'
+      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA."
     );
   }
   const { canonical } = await toEnglishCanonical(answer);
@@ -279,7 +263,7 @@ async function routeByCategory({ category, sessionId, userLang, userTextEN, user
   }
 
   if (!answer) {
-    const draftEN = await llmFallbackReply(sessionId, userTextEN, 'en');
+    const draftEN = await llmFallbackReply(sessionId, userTextEN);
     answer = await finalizeOut(draftEN, userLang);
   }
 
@@ -435,17 +419,8 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return short;
   }
 
-  // ▶ Сначала пробуем playbook (этапы)
-  const stageOut = await handleByStage({
-    sessionId,
-    userTextEN,
-    convLang,
-    persona
-  });
-  
-  // уже есть быстрые русские эвристики …
-// ДОБАВИМ авто-инференс из EN-версии сообщения:
-await inferQuickFacts(sessionId, userTextEN);
+  // ▶ Stage playbook first
+  const stageOut = await handleByStage({ sessionId, persona });
 
   if (stageOut && stageOut.textEN) {
     const final = await finalizeOut(stageOut.textEN, convLang);
@@ -459,7 +434,7 @@ await inferQuickFacts(sessionId, userTextEN);
     return final;
   }
 
-  // Если playbook не дал ответ — обычный роутер
+  // If playbook didn't produce output → category router
   const category = await classifyCategory(userTextRaw);
   switch (category) {
     case 'greeting':
