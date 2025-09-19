@@ -24,6 +24,7 @@ import { ensureName, upsertFacts, getSessionProfile } from "./memory.js";
 import { fetchRecentSummaries } from "./summaries.js";
 import { maybeUpdateStyle } from "./style.js";
 import { saveUserQuestion, findAnswerFromKB } from "./qna.js";
+import { DIRECT_LANGS, handleByStage, inferQuickFacts } from "./playbook.js";
 
 // ▶ Playbook (этапы диалога)
 import { DIRECT_LANGS, handleByStage } from "./playbook.js";
@@ -441,6 +442,10 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     convLang,
     persona
   });
+  
+  // уже есть быстрые русские эвристики …
+// ДОБАВИМ авто-инференс из EN-версии сообщения:
+await inferQuickFacts(sessionId, userTextEN);
 
   if (stageOut && stageOut.textEN) {
     const final = await finalizeOut(stageOut.textEN, convLang);
