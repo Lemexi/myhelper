@@ -1,9 +1,8 @@
-// memory.js
-import { db } from './db.js';
+// memory.js — имя + факты (через pool.query)
+import { pool } from './db.js';
 
-// базовые факты, которые мы держим в sessions
 export async function getSessionProfile(sessionId) {
-  const { rows } = await db.query(`
+  const { rows } = await pool.query(`
     SELECT id, user_name, user_surname, user_phone, user_email,
            role_guess, intent_main, country_interest, candidates_planned,
            psychotype, style_notes, stage, trust_score
@@ -14,7 +13,6 @@ export async function getSessionProfile(sessionId) {
 
 export function extractNameFrom(text) {
   if (!text) return null;
-  // очень простой извлекатель «меня зовут … / меня звать … / я …»
   const m1 = text.match(/меня\s+зовут\s+([А-ЯЁA-Z][а-яёa-z]+)(?:\s+([А-ЯЁA-Z][а-яёa-z]+))?/i);
   if (m1) return m1[1];
   const m2 = text.match(/^я\s+([А-ЯЁA-Z][а-яёa-z]+)/i);
@@ -23,7 +21,7 @@ export function extractNameFrom(text) {
 }
 
 export async function ensureName(sessionId, userMessage, tgMeta) {
-  const { rows } = await db.query('SELECT user_name FROM public.sessions WHERE id=$1', [sessionId]);
+  const { rows } = await pool.query('SELECT user_name FROM public.sessions WHERE id=$1', [sessionId]);
   const current = rows[0]?.user_name;
   if (current) return current;
 
@@ -32,13 +30,15 @@ export async function ensureName(sessionId, userMessage, tgMeta) {
   const finalName = fromText || fromTG || null;
 
   if (finalName) {
-    await db.query('UPDATE public.sessions SET user_name=$1, updated_at=NOW() WHERE id=$2', [finalName, sessionId]);
+    await pool.query(
+      'UPDATE public.sessions SET user_name=$1, updated_at=NOW() WHERE id=$2',
+      [finalName, sessionId]
+    );
     return finalName;
   }
   return null;
 }
 
-// апдейт фактов, безопасный (не затираем уже известное)
 export async function upsertFacts(sessionId, facts = {}) {
   const q = `
     UPDATE public.sessions SET
@@ -59,6 +59,6 @@ export async function upsertFacts(sessionId, facts = {}) {
     facts.candidates_planned ?? null,
     facts.stage ?? null
   ];
-  const { rows } = await db.query(q, vals);
+  const { rows } = await pool.query(q, vals);
   return rows[0];
 }
