@@ -33,7 +33,7 @@ import { DIRECT_LANGS, handleByStage } from "./playbook.js";
  * Helpers
  * ────────────────────────────────────────────────────────────*/
 
-// короткие просьбы с персоной (RU в CTA ок для RU; EN иначе)
+// короткие просьбы с персоной
 function personaReply(persona, shortAnswer, cta) {
   const T = {
     commander: (ans, c) => `${ans ? ans + '\n' : ''}План: ${c || 'Страна, позиция, ставка — и двигаемся.'}`,
@@ -85,7 +85,7 @@ function extractRequestedLang(text) {
   return null;
 }
 
-// EN→convLang если нужно; если ответ LLM не EN, нормализуем в целевой
+// EN→convLang если нужно; если ответ LLM не EN — нормализуем
 async function finalizeOut(textEN, convLang) {
   if (!textEN) return '';
   if (convLang === 'en') return textEN;
@@ -96,13 +96,11 @@ async function finalizeOut(textEN, convLang) {
 }
 
 async function llmFallbackReply(sessionId, userTextEN, _langIgnored, promptExtras = {}) {
-  // история → безопасный формат
   const recentRaw = await loadRecentMessages(sessionId, 18);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
     .filter(m => m.role && m.content);
 
-  // память
   const summaries = await fetchRecentSummaries(sessionId, 3);
   const profile   = await getSessionProfile(sessionId);
   const system    = buildSystemPrompt({
@@ -117,7 +115,7 @@ async function llmFallbackReply(sessionId, userTextEN, _langIgnored, promptExtra
       psychotype: profile?.psychotype,
       ...promptExtras
     },
-    locale: 'en' // держим системный промпт на EN
+    locale: 'en'
   });
 
   const msgs = buildMessages({ system, userText: userTextEN });
@@ -373,14 +371,14 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
-  await ensureName(sessionId, userTextRaw, extra?.tgMeta); // имя из текста; НЕ переименовываем по нику
+  await ensureName(sessionId, userTextRaw, extra?.tgMeta); // сохраняем, но не отображаем имя из TG
 
   const facts = {};
   if (/чех/i.test(userTextRaw)) facts.country_interest = 'CZ';
   if (/польш/i.test(userTextRaw)) facts.country_interest = 'PL';
   if (/литв/i.test(userTextRaw))  facts.country_interest = 'LT';
   if (/работа/i.test(userTextRaw)) facts.intent_main = 'work';
-  if (/бизнес|b2b|партнёр/i.test(userTextRaw)) facts.intent_main = facts.intent_main || 'business_b2b';
+  if (/бизнес|b2b|партн[её]р/i.test(userTextRaw)) facts.intent_main = facts.intent_main || 'business_b2b';
   const num = userTextRaw.match(/\b(\d{1,3})\s*(кандидат|люд)/i)?.[1];
   if (num) facts.candidates_planned = Number(num);
   if (Object.keys(facts).length) await upsertFacts(sessionId, facts);
@@ -392,9 +390,12 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   );
   await saveUserQuestion(sessionId, userTextEN);
 
-  // Имя — спросим максимум 2 раза (если явно не назвали)
-  const session = await getSession(sessionId);
-  const knownName = nameInThisMsg || session?.user_name?.trim();
+  // Имя — спрашиваем до 2 раз, только если НЕТ declared-имени
+  const profileForName = await getSessionProfile(sessionId);
+  const isDeclared = (profileForName?.meta?.user_name_source || "").toLowerCase() === "declared";
+  const declaredName = isDeclared ? (profileForName?.user_name || "").trim() : "";
+  const knownName = nameInThisMsg || declaredName; // игнорируем tg_meta
+
   if (!knownName) {
     const { asked, attempts } = await wasAsked(sessionId, 'user_name');
     if (!asked || attempts < 2) {
