@@ -1,51 +1,36 @@
 // /src/reply.js
-import { SYSTEM_PROMPT } from "./prompt.js";
+
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
   loadLatestSummary, logReply, getLastAuditCategory, getSession
 } from "./db.js";
+
 import { kbFind, kbInsertAnswer } from "./kb.js";
+
 import {
   translateCached, translateWithStyle,
   toEnglishCanonical, detectLanguage
 } from "./translator.js";
+
 import {
   classifyCategory, detectAnyName, detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
   isCmdAnswerExpensive, extractGreeting
 } from "./classifier.js";
+
 import { runLLM } from "./llm.js";
 
-/* ───────────────── LLM fallback ───────────────── */
-async function replyCore(sessionId, userTextEN) {
-  // Историю приводим к безопасному формату {role, content}
-  const recentRaw = await loadRecentMessages(sessionId, 24);
-  const recent = (recentRaw || [])
-    .map(m => ({ role: m.role, content: String(m.content ?? "") }))
-    .filter(m => m.role && m.content);
+import { buildSystemPrompt, buildMessages } from "./prompt.js";
+import { ensureName, upsertFacts, getSessionProfile } from "./memory.js";
+import { fetchRecentSummaries } from "./summaries.js";
+import { maybeUpdateStyle } from "./style.js";
+import { saveUserQuestion, findAnswerFromKB } from "./qna.js";
 
-  const summary = await loadLatestSummary(sessionId);
+/* ─────────────────────────────────────────────────────────────
+ * ВСПОМОГАТЕЛЬНОЕ
+ * ────────────────────────────────────────────────────────────*/
 
-  const messages = [];
-  messages.push({ role: "system", content: SYSTEM_PROMPT });
-  if (summary) {
-    messages.push({
-      role: "system",
-      content: `Краткая сводка прошлой истории:\n${summary}`
-    });
-  }
-  messages.push(...recent);
-  messages.push({ role: "user", content: userTextEN });
-
-  // Внутренняя страховка: удаляем любые посторонние поля
-  const safe = messages.map(m => ({ role: m.role, content: m.content }));
-
-  const { text } = await runLLM(safe);
-  return text;
-}
-
-/* ───────────────── Просьба имени ───────────────── */
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
   const by = {
@@ -58,7 +43,41 @@ function buildAskName(userLang, rawText) {
   return by[userLang] || by.en;
 }
 
-/* ───────────────── Команды ───────────────── */
+async function llmFallbackReply(sessionId, userTextEN, lang, promptExtras = {}) {
+  // история → безопасный формат
+  const recentRaw = await loadRecentMessages(sessionId, 18);
+  const recent = (recentRaw || [])
+    .map(m => ({ role: m.role, content: String(m.content ?? "") }))
+    .filter(m => m.role && m.content);
+
+  // память
+  const summaries = await fetchRecentSummaries(sessionId, 3);
+  const profile   = await getSessionProfile(sessionId);
+  const system    = buildSystemPrompt({
+    profile,
+    summaries,
+    facts: {
+      user_name: profile?.user_name,
+      country_interest: profile?.country_interest,
+      intent_main: profile?.intent_main,
+      candidates_planned: profile?.candidates_planned,
+      stage: profile?.stage,
+      psychotype: profile?.psychotype,
+      ...promptExtras
+    },
+    locale: lang
+  });
+
+  const msgs = buildMessages({ system, userText: userTextEN });
+  // подмешиваем историю (до юзерского)
+  const safe = [msgs[0], ...recent, msgs[1]].map(m => ({ role: m.role, content: m.content }));
+  const { text } = await runLLM(safe);
+  return text;
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * КОМАНДЫ
+ * ────────────────────────────────────────────────────────────*/
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
@@ -128,9 +147,10 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
       ? (await translateCached(kb.answer, "ru", userLang)).text
       : kb.answer;
   } else {
-    answer = await replyCore(
+    answer = await llmFallbackReply(
       sessionId,
-      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA."
+      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA.",
+      userLang
     );
   }
   const { canonical } = await toEnglishCanonical(answer);
@@ -143,17 +163,71 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* ───────────────── SmartReply ───────────────── */
+/* ─────────────────────────────────────────────────────────────
+ * КАТЕГОРИАЛЬНЫЙ РОУТЕР (легко расширять)
+ * ────────────────────────────────────────────────────────────*/
 
-export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
+async function routeByCategory({ category, sessionId, userLang, userTextEN, userMsgId }) {
+  // 1) Точная база QnA (совпадение вопроса)
+  const kbExact = await findAnswerFromKB(userTextEN, 0.9);
+  if (kbExact) {
+    const { canonical } = await toEnglishCanonical(kbExact);
+    await logReply(sessionId, "kb_exact", category, null, userMsgId, "qna exact");
+    await saveMessage(
+      sessionId, "assistant", canonical,
+      { category, strategy: "kb_exact" },
+      "en", userLang, kbExact, category
+    );
+    return kbExact;
+  }
+
+  // 2) Категорийная KB
+  let kb = await kbFind(category, userLang);
+  let answer = null;
+  let strategy = "fallback_llm";
+  let kbItemId = null;
+
+  if (kb?.answer) {
+    answer = kb.answer;
+    strategy = "kb_hit";
+    kbItemId = kb.id;
+  } else {
+    const kbRu = await kbFind(category, "ru");
+    if (kbRu?.answer) {
+      answer = (await translateCached(kbRu.answer, "ru", userLang)).text;
+      strategy = "kb_translated";
+      kbItemId = kbRu.id;
+    }
+  }
+
+  // 3) LLM
+  if (!answer) {
+    answer = await llmFallbackReply(sessionId, userTextEN, userLang);
+  }
+
+  const { canonical: ansEN } = await toEnglishCanonical(answer);
+  await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
+  await saveMessage(
+    sessionId, "assistant", ansEN,
+    { category, strategy },
+    "en", userLang, answer, category
+  );
+  return answer;
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * SMART REPLY (главная точка)
+ * ────────────────────────────────────────────────────────────*/
+
+export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru", extra = {}) {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канонизируем вход
+  // 0) Канонизация входа
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // Команды (сырые — внутри парсеры сами чистят)
+  // 1) Команды
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -190,18 +264,36 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // Имя / телефон
+  // 2) Имя/контакт + факты
+  // 2.1) извлечь имя/телефон из сообщения
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // Сохраняем вход пользователя
+  // 2.2) дополнительно — имя из Telegram-метаданных
+  await ensureName(sessionId, userTextRaw, extra?.tgMeta);
+
+  // 2.3) быстрые факты из текста
+  const facts = {};
+  if (/чех/i.test(userTextRaw)) facts.country_interest = 'CZ';
+  if (/польш/i.test(userTextRaw)) facts.country_interest = 'PL';
+  if (/литв/i.test(userTextRaw))  facts.country_interest = 'LT';
+  if (/работа/i.test(userTextRaw)) facts.intent_main = 'work';
+  if (/бизнес/i.test(userTextRaw)) facts.intent_main = 'business';
+  const num = userTextRaw.match(/\b(\d{1,3})\s*(кандидат|люд)/i)?.[1];
+  if (num) facts.candidates_planned = Number(num);
+  await upsertFacts(sessionId, facts);
+
+  // 3) Сохраняем вход пользователя
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
     null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим
+  // 3.1) сохраняем вопрос в QnA-историю (для последующего «я бы ответил»)
+  await saveUserQuestion(sessionId, userTextEN);
+
+  // 4) Если имени ещё нет — спросим (один раз)
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -215,40 +307,26 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // Классификация → KB → LLM
+  // 5) Обновим стиль по последним сообщениям (лёгкая эвристика)
+  await maybeUpdateStyle(sessionId);
+
+  // 6) Классификация → маршрутизация по категориям
   const category = await classifyCategory(userTextRaw);
 
-  let kb = await kbFind(category, userLang);
-  let answer, strategy = "fallback_llm", kbItemId = null;
-
-  if (kb) {
-    answer = kb.answer;
-    strategy = "kb_hit";
-    kbItemId = kb.id;
-  } else {
-    const kbRu = await kbFind(category, "ru");
-    if (kbRu) {
-      answer = (await translateCached(kbRu.answer, "ru", userLang)).text;
-      strategy = "kb_translated";
-      kbItemId = kbRu.id;
-    }
+  switch (category) {
+    case 'greeting':
+    case 'smalltalk':
+    case 'general':
+    case 'visa':
+    case 'work':
+    case 'business':
+    case 'docs':
+    case 'price':
+    case 'timeline':
+    case 'process':
+    case 'expensive':
+    default:
+      // общий путь (KB exact → KB category → LLM)
+      return await routeByCategory({ category, sessionId, userLang, userTextEN, userMsgId });
   }
-
-  if (!answer) {
-    answer = await replyCore(sessionId, userTextEN);
-    const detectedLLM = await detectLanguage(answer);
-    if (detectedLLM !== userLang) {
-      answer = (await translateCached(answer, detectedLLM, userLang)).text;
-    }
-  }
-
-  const { canonical: ansEN } = await toEnglishCanonical(answer);
-  await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
-  await saveMessage(
-    sessionId, "assistant", ansEN,
-    { category, strategy },
-    "en", userLang, answer, category
-  );
-
-  return answer;
 }
