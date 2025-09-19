@@ -1,60 +1,65 @@
-// /src/classifier.js
-// Lightweight NLP utils: normalization, commands, greetings, categories,
-// name/phone detection, gender guess, honorifics.
-// All code/comments may stay in RU; functional text is language-agnostic.
-
-/* ─────────── Нормализация ─────────── */
-
+// Нормализация и чистка цитат/префиксов
 export function norm(s = "") {
+  // аккуратно приводим пробелы и кавычки
   return (s || "")
-    .replace(/\u00A0/g, " ")      // NBSP → space
-    .replace(/\s+/g, " ")         // collapse spaces
-    .replace(/[«»]/g, '"')        // unify quotes
+    .replace(/\s+/g, " ")
+    .replace(/[«»”"'\u00A0]/g, '"')
     .trim();
 }
 
 export function lower(s = "") { return norm(s).toLowerCase(); }
 
-/** Удаляем цитаты и «шапки» переписки из мессенджеров */
 export function stripQuoted(raw = "") {
   const lines = (raw || "").split(/\r?\n/);
   const clean = [];
   for (const ln of lines) {
     const l = ln.trim();
     if (!l) continue;
-    if (l.startsWith(">")) continue; // quote
-    if (/^(from:|replying to|forwarded message)/i.test(l)) continue;
-    if (/^(assistant|bot)\b/i.test(l)) continue;
+    if (l.startsWith(">")) continue; // цитаты
+    if (/^assistant\b|renovogo.com|^bot\b|^from:|^replying to/i.test(l)) continue; // шапки
     clean.push(l);
   }
   return clean.join("\n").trim();
 }
 
-/* ─────────── Команды ─────────── */
+/* ─────────── Триггеры-команды ─────────── */
 
-/** «Я бы ответил… / Ответил бы…» */
+// «Я бы ответил/а …» — ловим варианты порядка слов и женскую форму
 export function isCmdTeach(raw = "") {
   const t = lower(raw);
-  return /(?:^|\s)(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы(?:\s+я)?)(?:\s|:|$)/i.test(t);
+  // Улучшенное регулярное выражение для всех вариантов
+  return /(?:^|\s)(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы\s+я|ответил[ао]?\s+бы)(?:\s|$)/i.test(t);
 }
 
 export function parseCmdTeach(raw = "") {
   const t = stripQuoted(raw);
+  
+  // Все возможные варианты команды
   const patterns = [
-    /(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы(?:\s+я)?)\s*:?\s*["“]?([\s\S]+?)["”]?\s*$/i
+    /(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы\s+я)\s*:?\s*["']?([\s\S]+)["']?$/i,
+    /ответил[ао]?\s+бы\s*:?\s*["']?([\s\S]+)["']?$/i,
+    /(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы\s+я)\s*:?\s*([\s\S]+)$/i,
+    /ответил[ао]?\s+бы\s*:?\s*([\s\S]+)$/i
   ];
-  for (const re of patterns) {
-    const m = t.match(re);
-    if (m && m[1]) return m[1].trim();
+  
+  for (const pattern of patterns) {
+    const m = t.match(pattern);
+    if (m && m[1]) {
+      const result = m[1].trim();
+      if (result) return result;
+    }
   }
-  const cleaned = t.replace(
-    /(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\с+бы|ответил[ао]?\с+бы(?:\s+я)?)\s*:?\s*/i,
-    ""
-  ).trim();
-  return cleaned || null;
+  
+  // Альтернативный подход: просто удаляем команду
+  const cleaned = t.replace(/(?:я\s+бы\s+ответил[ао]?|я\s+ответил[ао]?\s+бы|ответил[ао]?\s+бы\s+я|ответил[ао]?\s+бы)\s*:?\s*/i, "").trim();
+  if (cleaned !== t && cleaned) {
+    return cleaned;
+  }
+  
+  return null;
 }
 
-/** «Переведи …» / «translate (to) …» */
+// Перевод: поддержим «переведи», «переклади», «translate (to)»
 export function isCmdTranslate(raw = "") {
   const t = lower(raw);
   return /\b(переведи|переклади|translate)\b/.test(t);
@@ -62,126 +67,97 @@ export function isCmdTranslate(raw = "") {
 
 export function parseCmdTranslate(raw = "") {
   const t = stripQuoted(raw);
-  const re = /(?:переведи|переклади|translate)(?:\s+(?:на|to)\s+([A-Za-zА-Яа-яёіїєґ\s.-]{1,20}))?\s*:?\s*([\s\S]*?)$/i;
+  // Более точное регулярное выражение
+  const re = /(?:переведи|переклади|translate)(?:\s+(?:на|to)\s+([A-Za-zА-Яа-яёіїєґ.\s]{1,20}))?\s*:?\s*([\s\S]*?)$/i;
   const m = t.match(re);
-  return {
-    targetLangWord: (m?.[1] || "").trim().toLowerCase() || null,
-    text: (m?.[2] || "").trim()
-  };
+
+  let targetLangWord = null;
+  let text = "";
+
+  if (m) {
+    targetLangWord = (m[1] || "").trim().toLowerCase() || null;
+    text = (m[2] || "").trim();
+  }
+
+  return { targetLangWord, text };
 }
 
-/** Шорткат для «ответь на дорого» */
 export function isCmdAnswerExpensive(raw = "") {
   const s = lower(raw);
-  return (
-    s.includes("ответь на дорого") ||
-    s.includes("агент говорит что дорого") ||
-    s.includes("too expensive") ||
-    s.includes("дорого")
-  );
+  return s.includes("ответь на дорого") || s.includes("агент говорит что дорого");
+}
+
+export function isCmdAnswerGeneric(raw = "") {
+  return /^ответь\s+на\s+/i.test(stripQuoted(raw));
 }
 
 /* ─────────── Приветствия ─────────── */
-
 const greetMap = [
-  { re: /добрый\s*д(е|ё)нь/i,  out: "Добрый день" },
-  { re: /добрый\s*вечер/i,    out: "Добрый вечер" },
-  { re: /здравствуй(те)?/i,   out: "Здравствуйте" },
-  { re: /привет/i,            out: "Привет" },
-  { re: /\bhello\b/i,         out: "Hello" },
-  { re: /\bhi\b/i,            out: "Hi" }
+  { re: /добрый\s*д(е|ё)нь/i, ru: "Добрый день" },
+  { re: /добрый\s*вечер/i,   ru: "Добрый вечер" },
+  { re: /здравствуй(те)?/i,  ru: "Здравствуйте" },
+  { re: /привет/i,           ru: "Привет" },
+  { re: /\bhello\b/i,        ru: "Hello" },
+  { re: /\bhi\b/i,           ru: "Hi" }
 ];
 
 export function extractGreeting(raw = "") {
-  const hit = greetMap.find(g => g.re.test(raw || ""));
-  return hit ? hit.out : null;
+  const hit = greetMap.find(g => g.re.test(raw));
+  return hit ? hit.ru : null;
 }
 
-/* ─────────── Классификатор категорий (rule-based фолбэк) ─────────── */
-
-function classifyCategoryRuleBased(text = "") {
+/* ─────────── Классификатор (фолбэк) ─────────── */
+export async function classifyCategoryRuleBased(text = "") {
   const t = lower(text);
-  if (/дорог|expens|price|цена/.test(t)) return "expensive";
-  if (/(после\s+визы|after\s+visa)/.test(t)) return "after_visa";
-  if (/(контракт|agreement|договор)/.test(t)) return "contract";
-  if (/(вакан|demands?|позици|role)/.test(t)) return "demands";
-  if (/(виза|visa)/.test(t)) return "visa";
-  if (/(работ|job|трудо)/.test(t)) return "work";
-  if (/(бизнес|company|firm|LLC|sp\.z o\.o)/.test(t)) return "business";
-  if (/(срок|timeline|когда|how long)/.test(t)) return "timeline";
-  if (/(процес|как это работает|process)/.test(t)) return "process";
-  if (/(документ|docs?|паспорт|permit)/.test(t)) return "docs";
-  if (/(привет|hello|hi|здравствуй)/.test(t)) return "greeting";
-  if (/(как дела|how are you|чем занимаешься)/.test(t)) return "smalltalk";
+  if (t.includes("дорог") || t.includes("price")) return "expensive";
+  if (t.includes("после виз") || t.includes("after visa")) return "after_visa";
+  if (t.includes("контракт") || t.includes("agreement")) return "contract";
+  if (t.includes("деманд") || t.includes("vacanc")) return "demands";
   return "general";
 }
 
 export const classifyCategory = classifyCategoryRuleBased;
 
 /* ─────────── Имя / телефон ─────────── */
-
-export function detectNameSentence(text = "") {
-  // «Меня зовут …» / «My name is …» / «I am …»
-  const m =
-    text?.match(/\b(меня\s+зовут|my\s+name\s+is|i\s+am|i'm|мене\s+звати|jmenuji\s+se|mam\s+na\s+imi[eę])\s+([^\d,.;:()[\]{}!?]{2,60})/i);
-  if (!m) return null;
-  // убираем хвостовые маркеры и эмодзи
-  return m[2].replace(/["'«»]/g, "").trim();
+export function detectNameSentence(text) {
+  // Упрощенное регулярное выражение без проблемных символов
+  const m = text?.match(
+    /\b(меня зовут|i am|my name is|мене звати|mam na imie|jmenuji se)\s+([A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,}\s*[A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']*)/i
+  );
+  return m ? m[2].trim() : null;
 }
 
-export function detectStandaloneName(text = "") {
+export function detectStandaloneName(text) {
   const t = norm(text);
-  if (/^[A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,29}(?:\s+[A-ZА-Я][A-Za-zА-Яа-я\-']{1,29})?$/.test(t)) {
-    return t;
-  }
+  if (/^[A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,29}$/i.test(t)) return t;
   return null;
 }
 
-export function detectLeadingName(text = "") {
+export function detectLeadingName(text) {
   const m = norm(text).match(
     /^([A-ZА-Я][A-Za-zА-Яа-яЁёЇїІіЄєҐґ\-']{1,29})\s*[,—-]/i
   );
   return m ? m[1].trim() : null;
 }
 
-export function detectAnyName(text = "") {
+export function detectAnyName(text) {
   return detectNameSentence(text) || detectStandaloneName(text) || detectLeadingName(text);
 }
 
-export function detectPhone(text = "") {
+export function detectPhone(text) {
   const m = text?.match(/\+?[0-9][0-9 \-()]{6,}/);
   return m ? m[0].replace(/[^\d+]/g, "") : null;
 }
 
-/* ─────────── Пол и обращение (опционально) ─────────── */
-/** Пробуем угадать пол по явным подсказкам; fallback — male */
-export function guessGenderByName(nameRaw = "", context = "") {
-  const first = lower(nameRaw).split(/\s+/)[0];
-  if (!first) return "male";
+/* ─────────── Пол + обращение ─────────── */
+const FEMALE_ENDINGS = ["а","я","ia","iia","na","ta","ra","la","sha","scha","ska","eva","ina","yna","ena","onna","anna","alla","ella","maria","olga","irina","natalia","natalya","oksana","tatiana","tetiana","svetlana","svitlana","alena","sofia","zofia","ewa","agnieszka","kasia","katarzyna","aleksandra","veronika","veronica"];
 
-  // Явные языковые формы в сообщении
-  const ctx = lower(context);
-  if (/(я\s+не\s+женщина|i\s+am\s+male|i'm\s+male|i\s+am\s+a\s+man)/.test(ctx)) return "male";
-  if (/(я\s+не\s+мужчина|i\s+am\s+female|i'm\s+female|i\s+am\s+a\s+woman)/.test(ctx)) return "female";
-
-  // Списки-индикаторы (минимальные, универсальные)
-  const femaleHints = [
-    "alina","alena","anna","anita","anastasia","alexandra","maria","mariya","maryam",
-    "fatima","aisha","sara","sarah","noor","zainab","olga","irina","natalia","oksana",
-    "tatiana","svetlana","sofia","sofiya","katarzyna","agnieszka","ewa","kasia","zofia",
-    "veronika","victoria","viktoria"
-  ];
-  const maleHints = [
-    "alexander","aleksandr","oleksandr","andrei","andrey","andriy","mohamed","muhammad",
-    "ahmed","ali","hassan","omar","youssef","yusuf","mohammad","jan","tomas","marek",
-    "piotr","pawel","michal","pavel","sergey","serhii","viktor","victor"
-  ];
-  if (femaleHints.includes(first)) return "female";
-  if (maleHints.includes(first)) return "male";
-
-  // Окончания (очень грубая эвристика)
-  if (/(a|ya|iya|sha|na|ta|ra|la)$/.test(first)) return "female";
-
+export function guessGenderByName(nameRaw = "") {
+  const first = lower(nameRaw).split(" ")[0];
+  if (!first) return null;
+  const maleList = ["alexander","oleksandr","aleksandr","andrzej","jan","tomas","marek","piotr","pavel","pawel","michal","mikhail","sergey","serhii","vasyl","viktor"];
+  if (maleList.includes(first)) return "male";
+  if (FEMALE_ENDINGS.some(s => first.endsWith(s))) return "female";
   return "male";
 }
 
@@ -196,24 +172,3 @@ export function honorific(lang = "ru", gender = "male") {
     case "en": default: return isF ? "Ma'am" : "Sir";
   }
 }
-
-/* ─────────── Явный экспорт (для ESM) ─────────── */
-export default {
-  norm,
-  lower,
-  stripQuoted,
-  isCmdTeach,
-  parseCmdTeach,
-  isCmdTranslate,
-  parseCmdTranslate,
-  isCmdAnswerExpensive,
-  extractGreeting,
-  classifyCategory,
-  detectAnyName,
-  detectPhone,
-  detectNameSentence,
-  detectStandaloneName,
-  detectLeadingName,
-  guessGenderByName,
-  honorific
-};
