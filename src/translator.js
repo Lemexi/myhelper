@@ -2,85 +2,37 @@
 import { pool } from "./db.js";
 import { runLLM } from "./llm.js";
 
-/* ─────────────────────────────────────────────────────────────
- * НОРМАЛИЗАЦИЯ ЯЗЫКОВ
- * ────────────────────────────────────────────────────────────*/
-
-// Синонимы → ISO коды; чешский нормализуем в cs
+/* ── Маппинг слов → коды ── */
 const LangMap = {
-  // English
   "английский": "en", english: "en", eng: "en", en: "en",
-  // Russian
+  "чешский": "cz", czech: "cz", cz: "cz", cs: "cz",
+  "польский": "pl", polish: "pl", pl: "pl",
+  "украинский": "uk", ukrainian: "uk", uk: "uk",
   "русский": "ru", russian: "ru", ru: "ru",
-  // Polish
-  "польский": "pl", polish: "pl", "po polsku": "pl", pl: "pl",
-  // Czech (normalize cz→cs)
-  "чешский": "cs", czech: "cs", cz: "cs", cs: "cs", český: "cs", česky: "cs",
-  // Ukrainian
-  "украинский": "uk", ukrainian: "uk", uk: "uk", "по-украински": "uk",
-  // Extras we may mention (fallback handled elsewhere)
-  arabic: "ar", "арабский": "ar", ar: "ar",
-  hebrew: "he", "иврит": "he", he: "he"
 };
 
 export function resolveTargetLangCode(word) {
-  if (!word || !word.trim()) return "en";
+  if (!word || word.trim() === "") return "en"; // По умолчанию английский
   const key = word.toLowerCase().trim();
-  return LangMap[key] || key.slice(0, 2) || "en";
+  return LangMap[key] || "en"; // Если язык не найден, тоже английский
 }
 
-// Нормализуем входной код (включая cz→cs)
-function normalizeLang(code) {
-  if (!code) return "en";
-  const c = String(code).toLowerCase();
-  if (c === "cz") return "cs";
-  if (c.startsWith("en")) return "en";
-  if (c.startsWith("ru")) return "ru";
-  if (c.startsWith("pl")) return "pl";
-  if (c.startsWith("cs") || /čes|cesk/i.test(c)) return "cs";
-  if (c.startsWith("uk")) return "uk";
-  if (c.startsWith("ar")) return "ar";
-  if (c.startsWith("he")) return "he";
-  return c.slice(0, 2);
-}
-
-/* ─────────────────────────────────────────────────────────────
- * ДЕТЕКТ ЯЗЫКА
- * ────────────────────────────────────────────────────────────*/
-
+/* ── Детект языка ── */
 export async function detectLanguage(text) {
-  const sample = (text || "").slice(0, 500);
-  if (!sample.trim()) return "en";
-
-  // Просим LLM вернуть только ISO-код (две буквы, или cs/uk/he/ar)
   const { text: out } = await runLLM(
     [
-      {
-        role: "system",
-        content:
-          "Detect the language of the USER text and output ONLY an ISO code from this set: " +
-          "en, ru, pl, cs, uk, ar, he. If unsure, output en. No extra words."
-      },
-      { role: "user", content: sample }
+      { role: "system", content: "Detect language code among: en,ru,uk,pl,cz. Output only the code." },
+      { role: "user", content: (text || "").slice(0, 500) }
     ],
-    { max_tokens: 6 }
+    { max_tokens: 5 }
   );
-
-  const raw = (out || "en").trim().toLowerCase();
-  const code = normalizeLang(raw);
-  return ["en", "ru", "pl", "cs", "uk", "ar", "he"].includes(code) ? code : "en";
+  const code = (out || "en").trim().toLowerCase();
+  return ["en", "ru", "uk", "pl", "cz"].includes(code) ? code : "en";
 }
 
-/* ─────────────────────────────────────────────────────────────
- * КЭШ ПЕРЕВОДОВ
- * ────────────────────────────────────────────────────────────*/
-
+/* ── Кэш перевода ── */
 export async function translateCached(text, sourceLang, targetLang) {
-  if (!text) return { text: "", cached: true };
-  const src = normalizeLang(sourceLang);
-  const tgt = normalizeLang(targetLang);
-
-  if (src === tgt) return { text, cached: true };
+  if (!text || sourceLang === targetLang) return { text, cached: true };
 
   const sel = `
     SELECT translated_text
@@ -88,12 +40,12 @@ export async function translateCached(text, sourceLang, targetLang) {
     WHERE source_lang=$1 AND target_lang=$2 AND md5(source_text)=md5($3)
     LIMIT 1
   `;
-  const hit = await pool.query(sel, [src, tgt, text]);
+  const hit = await pool.query(sel, [sourceLang, targetLang, text]);
   if (hit.rows.length) return { text: hit.rows[0].translated_text, cached: true };
 
   const { text: translated } = await runLLM([
-    { role: "system", content: "Translate faithfully with natural style. Output only the translated text, no explanations." },
-    { role: "user", content: `Translate from ${src} to ${tgt}:\n${text}` }
+    { role: "system", content: "Translate faithfully with natural style. Output only the translated sentence(s), no explanations." },
+    { role: "user", content: `Translate from ${sourceLang} to ${targetLang}:\n${text}` }
   ]);
 
   const ins = `
@@ -101,45 +53,38 @@ export async function translateCached(text, sourceLang, targetLang) {
     VALUES ($1,$2,$3,$4,$5)
     ON CONFLICT DO NOTHING
   `;
-  await pool.query(ins, [text, src, tgt, translated, "groq"]);
+  await pool.query(ins, [text, sourceLang, targetLang, translated, "groq"]);
   return { text: translated, cached: false };
 }
 
-/* ─────────────────────────────────────────────────────────────
- * КАНОНИЗАЦИЯ: ВСЁ В EN
- * ────────────────────────────────────────────────────────────*/
-
+/* ── Канонизация: всё в EN ── */
 export async function toEnglishCanonical(text) {
-  const src = normalizeLang(await detectLanguage(text));
+  const src = await detectLanguage(text);
   if (src === "en") return { canonical: text, sourceLang: "en", original: text };
   const { text: canonical } = await translateCached(text, src, "en");
   return { canonical, sourceLang: src, original: text };
 }
 
-/* ─────────────────────────────────────────────────────────────
- * ПЕРЕВОД С «УСИЛЕНИЕМ» ДЛЯ WHATSAPP-СТИЛЯ
- * ────────────────────────────────────────────────────────────*/
-
+/* ── Перевод с «усилением»: B2B-ритм, влияние/маркетинг ── */
 export async function translateWithStyle({ sourceText, targetLang }) {
-  const target = normalizeLang(targetLang || "en");
+  const target = (targetLang || "en").toLowerCase();
 
   const { text: styledRaw } = await runLLM([
     {
       role: "system",
       content:
-        "You are a senior B2B copywriter for WhatsApp/Email. Rewrite the user's message in TARGET language.\n" +
-        "Goals: clarity, credibility, warmth; ethical persuasion (Cialdini 1–2 cues max); concrete benefits; soft CTA if natural.\n" +
-        "Constraints: 1–4 short sentences, no fluff, no headers, no labels, no quotes, no explanations.\n" +
-        "Output ONLY the rewritten text."
+        "You are a senior B2B copywriter for WhatsApp/Email. Rewrite the user's message in the TARGET language.\n" +
+        "Goals: high clarity, credibility, warmth; persuasive but ethical; subtle Cialdini (1–2 cues max);\n" +
+        "use neuromarketing micro-cues, concrete benefits, and a soft CTA if natural.\n" +
+        "Constraints: 1–4 short sentences, no fluff, no headers, no quotes, no labels, no explanations.\n" +
+        "Output ONLY the rewritten text in the target language."
     },
     { role: "user", content: `TARGET=${target}\nTEXT:\n${sourceText}` }
   ]);
 
-  // убрать возможные лейблы типа "Translation:"
-  let styled = (styledRaw || "").trim()
-    .replace(/^(english|polish|russian|ukrainian|czech)?\s*translation\s*:\s*/i, "")
-    .replace(/^(перевод)\s*:\s*/i, "")
-    .trim();
+  // Подчистим возможные лейблы типа "Translation:"
+  let styled = (styledRaw || "").trim();
+  styled = styled.replace(/^(english translation|translation|перевод)\s*:\s*/i, "").trim();
   if ((styled.startsWith('"') && styled.endsWith('"')) || (styled.startsWith("“") && styled.endsWith("”"))) {
     styled = styled.slice(1, -1).trim();
   }
