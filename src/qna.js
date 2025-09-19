@@ -1,5 +1,5 @@
-// qna.js
-import { db } from './db.js';
+// qna.js — «я бы ответил»: нормализация + похожесть
+import { pool } from './db.js';
 
 function normalize(text) {
   return (text || '')
@@ -17,19 +17,17 @@ function jaccard(a, b) {
   return inter / uni;
 }
 
-// сохраняем «последний вопрос пользователя»
 export async function saveUserQuestion(sessionId, userText) {
   const norm = normalize(userText);
-  await db.query(`
+  await pool.query(`
     INSERT INTO public.kb_qna (lang, question_norm_en, question_raw, answer_text, source, session_id, uses, created_at)
     VALUES ('ru', $1, $2, NULL, 'user_question', $3, 0, NOW())
   `, [norm, userText, sessionId]);
 }
 
-// ищем в KB похожие вопросы и случайный ответ
 export async function findAnswerFromKB(userText, threshold = 0.9) {
   const norm = normalize(userText);
-  const { rows } = await db.query(`
+  const { rows } = await pool.query(`
     SELECT id, question_norm_en AS norm_q, answer_text
     FROM public.kb_qna
     WHERE answer_text IS NOT NULL AND answer_text <> ''
@@ -42,6 +40,6 @@ export async function findAnswerFromKB(userText, threshold = 0.9) {
 
   if (!candidates.length) return null;
   const pick = candidates[Math.floor(Math.random() * candidates.length)];
-  await db.query(`UPDATE public.kb_qna SET uses = COALESCE(uses,0)+1 WHERE id=$1`, [pick.id]);
+  await pool.query(`UPDATE public.kb_qna SET uses = COALESCE(uses,0)+1 WHERE id=$1`, [pick.id]);
   return pick.answer_text;
 }
