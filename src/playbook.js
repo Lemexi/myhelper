@@ -1,15 +1,15 @@
 // /src/playbook.js
-// Dialogue stages engine (intro → discovery → demo → specifics).
-// Copy is EN-only; reply.js will translate if needed.
+// Conversational playbook: intro → discovery → demo → specifics.
+// Human-like tone with persona styles; one-question-at-a-time; no markdown bold.
 
 import { pool } from "./db.js";
-import { getSessionProfile, upsertFacts } from "./memory.js";
+import { getSessionProfile } from "./memory.js";
 
-// Direct languages we can speak without disclaimer.
-// Other languages → we talk EN by default (or switch with translator notice in reply.js).
-export const DIRECT_LANGS = new Set(["en", "ru", "pl", "cz"]);
+// Direct languages we can speak without translator notice.
+// (Reply layer will translate EN → user language when needed.)
+export const DIRECT_LANGS = new Set(["en", "ru", "pl", "cs"]);
 
-/* ---------------- asked flags (anti-repeat) ---------------- */
+/* --------------------- asked flags: anti-repeat --------------------- */
 async function getAskedState(sessionId){
   const { rows } = await pool.query(
     "SELECT asked_fields, asked_attempts FROM public.sessions WHERE id=$1",
@@ -20,13 +20,17 @@ async function getAskedState(sessionId){
 }
 async function markAsked(sessionId, keys){
   const { fields, attempts } = await getAskedState(sessionId);
-  const nf = { ...fields }, na = { ...attempts };
-  for (const k of keys){ nf[k] = true; na[k] = (na[k] || 0) + 1; }
+  const nextFields = { ...fields };
+  const nextAttempts = { ...attempts };
+  for (const k of keys){
+    nextFields[k] = true;
+    nextAttempts[k] = (nextAttempts[k] || 0) + 1;
+  }
   await pool.query(
     `UPDATE public.sessions
        SET asked_fields=$2::jsonb, asked_attempts=$3::jsonb, updated_at=NOW()
      WHERE id=$1`,
-    [sessionId, nf, na]
+    [sessionId, nextFields, nextAttempts]
   );
 }
 async function wasAsked(sessionId, key){
@@ -34,163 +38,208 @@ async function wasAsked(sessionId, key){
   return { asked: !!fields[key], attempts: attempts[key] || 0 };
 }
 
-/* ---------------- persona CTA sugar ------------------------ */
-// RU-стили оставили короткими; текст сам по себе EN ниже.
-function personaCTA(persona, short, cta){
-  const T = {
-    commander: (a,c)=>`${a?a+"\n":""}Plan: ${c||"country, role, rate — and we move."}`,
-    diplomat:  (a,c)=>`${a?a+"\n":""}Precisely: ${c||"please specify country/role/rate."}`,
-    humanist:  (a,c)=>`${a?"I hear you. "+a+"\n":""}I’ll keep it gentle — ${c||"share the details and we continue."}`,
-    star:      (a,c)=>`${a?a+"\n":""}Short: ${c||"country + rate — let’s go."}`,
-    default:   (a,c)=>`${a?a+"\n":""}${c||"Please share country, role and rate."}`
-  };
-  return (T[persona] || T.default)(short, cta);
-}
-
-/* ---------------- stage texts (no **bold**) ---------------- */
-function greetText(name){
-  return `Hi${name?`, ${name}`:""}! I'm Viktor from RenovoGo. We help with legal EU job placement and business setup.`;
-}
-function quickCheckText(){
-  return `Quick check so I guide you right:
-- Are you an agency/recruiter or a private person looking for a job?
-- What is your current goal: work or business setup?
-Reply in 1–2 lines and I’ll route next steps.`;
-}
-function discoveryAsk(persona, missing){
-  const short = (missing.length === 1)
-    ? `Need: ${missing[0]}`
-    : `Need: ${missing.join(", ")}`;
-  const cta = "Please send and I will continue.";
-  return personaCTA(persona, short, cta);
-}
-function demoTextAgency(){
-  return (
-`How we work with agencies:
-1) We verify your case and documents.
-2) We agree on contract type, timelines and responsibilities.
-3) We start with a pilot (1 candidate) — fast and transparent.
-We work legally in Poland and Czechia: full package from work authorization to embassy booking where possible.`
-  );
-}
-function demoTextCandidate(){
-  return (
-`How I help candidates:
-1) I assess your profile and legal options.
-2) We choose a country, role and realistic salary/timelines.
-3) We proceed step-by-step with legal paperwork and job placement.`
-  );
-}
-function specificsAsk(){
-  return "Please share what you have: website/business card, sample role/contract, expected rate and timelines — I’ll propose a pilot.";
-}
-
-/* ---------------- light intent extraction ------------------ */
-// Very small heuristics to set facts before stage logic.
-export function inferQuickFacts(text){
-  const t = (text || "").toLowerCase();
-
-  const facts = {};
-  if (/\b(b2b|agency|recruit(er|ing)|агентств|рекрутер|подбор|кадров)\b/i.test(text)) {
-    facts.lead_type = "agency";
-    facts.intent_main = "business";
-  }
-  if (/\bprivate person|я ищу работу|ищу работу|candidate\b/i.test(text)) {
-    facts.lead_type = "candidate";
-    facts.intent_main = facts.intent_main || "work";
-  }
-
-  if (/qatar|катар/i.test(text)) facts.country_origin = "QA";
-  if (/poland|польш|polska|pl\b/i.test(text)) facts.country_interest = "PL";
-  if (/czech|чех|czechia|cz\b/i.test(text)) facts.country_interest = "CZ";
-
-  // role keywords
-  if (/welder|свар|driver|водител|cook|повар|builder|строит/i.test(text))
-    facts.intent_main = "work";
-
-  // rough candidates quantity
-  const n = text.match(/\b(\d{1,3})\s*(people|кандидат|люд)/i)?.[1];
-  if (n) facts.candidates_planned = Number(n);
-
-  return facts;
-}
-
-/* ---------------- main stage engine ------------------------ */
-export async function handleByStage({ sessionId, persona }) {
-  let stage = "intro";
-  const profile = await getSessionProfile(sessionId);
-  const name  = (profile?.user_name || "").trim();
-
-  // figure current stage from db
+/* --------------------- stage helpers --------------------- */
+export async function getStage(sessionId){
   const { rows } = await pool.query("SELECT stage FROM public.sessions WHERE id=$1", [sessionId]);
-  if (rows[0]?.stage) stage = rows[0].stage;
+  return rows[0]?.stage || "intro";
+}
+export async function setStage(sessionId, stage){
+  await pool.query("UPDATE public.sessions SET stage=$2, updated_at=NOW() WHERE id=$1", [sessionId, stage]);
+}
 
-  /* INTRO — greet once; if user already told plan, skip “how can I help” */
+/* --------------------- tiny NLP on EN text --------------------- */
+// crude intent signals, works on canonical EN passed from reply.js
+function hasAny(s, arr){ const t = (s||"").toLowerCase(); return arr.some(k=>t.includes(k)); }
+function detectClientType(textEN){
+  const t = (textEN||"").toLowerCase();
+  const isB2B = hasAny(t, ["agency", "recruiter", "b2b", "candidates", "office", "we hire", "our clients"]);
+  const isB2C = hasAny(t, ["i need a job", "looking for a job", "for myself", "cv", "resume"]);
+  if (isB2B && !isB2C) return "b2b";
+  if (isB2C && !isB2B) return "b2c";
+  return null;
+}
+function detectCountryMention(textEN){
+  const m = (textEN||"").match(/\b(czech|poland|polish|czechia|lithuania|latvia|estonia|germany|netherlands|france|italy)\b/i);
+  return m ? m[0].toLowerCase() : null;
+}
+function detectCandidatesCount(textEN){
+  const m = (textEN||"").match(/\b(\d{1,3})\s+(candidates|people|workers)\b/i);
+  return m ? parseInt(m[1],10) : null;
+}
+function detectUserSaysMyNameIs(textEN){
+  const m = (textEN||"").match(/\b(my name is|i am)\s+([a-z][a-z'-]{1,30})(\s+[a-z'-]{1,30})?/i);
+  return m ? m[2][0].toUpperCase()+m[2].slice(1) : null;
+}
+
+/* --------------------- persona tone layer --------------------- */
+function tone(persona){
+  // micro-variations by style; all short, human-sounding
+  switch (persona){
+    case "star":
+      return {
+        warm: (s)=>`Love it. ${s}`,
+        greet: (n)=>`Hey${n?`, ${n}`:""}! I’m Viktor from RenovoGo.`,
+        bridge: (s)=>`${s} By the way, great direction.`,
+        returnToGoal: (s)=>`${s} Let’s make it practical in one step.`
+      };
+    case "commander":
+      return {
+        warm: (s)=>s,
+        greet: (n)=>`Hello${n?`, ${n}`:""}. Viktor here from RenovoGo.`,
+        bridge: (s)=>s,
+        returnToGoal: (s)=>`${s} Next: one detail and we move.`
+      };
+    case "diplomat":
+      return {
+        warm: (s)=>`Appreciate the context. ${s}`,
+        greet: (n)=>`Good to meet you${n?`, ${n}`:""}. I’m Viktor from RenovoGo.`,
+        bridge: (s)=>`${s} Thanks for sharing.`,
+        returnToGoal: (s)=>`${s} May I clarify one point?`
+      };
+    case "humanist":
+      return {
+        warm: (s)=>`I hear you. ${s}`,
+        greet: (n)=>`Hi${n?`, ${n}`:""}. I’m Viktor from RenovoGo.`,
+        bridge: (s)=>`${s} That makes sense.`,
+        returnToGoal: (s)=>`${s} Let’s keep it easy, step by step.`
+      };
+    default:
+      return {
+        warm: (s)=>s,
+        greet: (n)=>`Hi${n?`, ${n}`:""}. I’m Viktor from RenovoGo.`,
+        bridge: (s)=>s,
+        returnToGoal: (s)=>s
+      };
+  }
+}
+
+/* --------------------- stock texts (EN only) --------------------- */
+function greetBlock(name){
+  // playful mirror if same name Viktor
+  if (name && name.toLowerCase().startsWith("viktor"))
+    return `Nice to meet you, Viktor — fun coincidence, that’s my name too. I help with legal EU employment and business setup.`;
+  return `Nice to meet you${name?`, ${name}`:""}. I help with legal EU employment and business setup.`;
+}
+
+function askClientType(){
+  return "Quick check so I guide you right: are you an agency/recruiter (B2B) or an individual looking for a job (for yourself)? Reply in 1–2 lines.";
+}
+
+function askCountry(){
+  return "Which EU country is relevant now?";
+}
+function askB2BVolume(){
+  return "Roughly how many candidates per month do you handle?";
+}
+function askB2CProfile(){
+  return "What role or profession are you targeting, and what experience level?";
+}
+
+function demoB2B(){
+  return `How we usually help agencies:
+• Markets: Czech Republic and Poland.
+• Full cycle: legal work permits, onboarding, embassy slots where possible.
+• Start with a small pilot (1–3 people), then scale.
+If this fits, I’ll outline terms in simple steps.`;
+}
+function demoB2C(){
+  return `Here’s how it works for an individual:
+• Focus on legal job options in the EU (Czech Republic / Poland).
+• We review your profile and documents, discuss timelines and conditions.
+• Start with the first vacancy that matches, then move forward.
+If that’s fine, I’ll ask one practical thing next.`;
+}
+
+function askSpecificsDocs(){
+  return "Please share what you have: website/card, sample contract/role, expected rate and timelines — I’ll propose a pilot.";
+}
+
+/* --------------------- MAIN ENGINE --------------------- */
+export async function handleByStage({ sessionId, userTextEN, convLang, persona }) {
+  const style = tone(persona || "default");
+  const stage = await getStage(sessionId);
+  const profile = await getSessionProfile(sessionId);
+  const name = (profile?.user_name || detectUserSaysMyNameIs(userTextEN) || "").trim();
+
+  // INTRO: greet once; if user already gave intro/context, mirror it lightly.
   if (stage === "intro"){
     const greeted = await wasAsked(sessionId, "intro_greeted");
     if (!greeted.asked){
       await markAsked(sessionId, ["intro_greeted"]);
-      // greet, then immediately do a quick check instead of “How can I help?”
-      return {
-        textEN: `${greetText(name || null)}\n${quickCheckText()}`,
-        stage,
-        strategy: "intro:greet+check"
-      };
+      const textEN = `${style.greet(name)} ${greetBlock(name)} ${style.bridge("")}${askClientType()}`;
+      return { textEN: textEN.trim(), stage, strategy: "intro:greet" };
     }
-    if (!name){
-      const asked = await wasAsked(sessionId, "user_name");
-      if (asked.attempts < 2){
-        await markAsked(sessionId, ["user_name"]);
-        return { textEN: "How should I address you?", stage, strategy: "intro:ask_name" };
-      }
-    }
-    // jump to discovery
-    await pool.query("UPDATE public.sessions SET stage='discovery', updated_at=NOW() WHERE id=$1", [sessionId]);
-    stage = "discovery";
+    // If we’re still in intro but name is missing, reply.js will ask name;
+    // Here we gently move to discovery after first turn.
+    await setStage(sessionId, "discovery");
   }
 
-  /* DISCOVERY — collect essentials; then show demo tailored by lead_type */
+  // DISCOVERY: figure out client type, country, then branch.
   if (stage === "discovery"){
-    const miss = [];
-    if (!profile?.country_interest)   miss.push("country");
-    if (!profile?.intent_main)        miss.push("role");
-    if (!profile?.candidates_planned && profile?.lead_type === "agency") miss.push("candidates");
-
-    if (miss.length){
-      // ask each missing at most once
-      const askKeys = [];
-      for (const k of miss){
-        const was = await wasAsked(sessionId, `ask_${k}`);
-        if (was.attempts < 1) askKeys.push(k);
+    // 1) client type
+    const clientType = detectClientType(userTextEN) || profile?.intent_main; // reuse if was saved as rough signal
+    if (!clientType){
+      const was = await wasAsked(sessionId, "ask_client_type");
+      if (!was.asked){
+        await markAsked(sessionId, ["ask_client_type"]);
+        return { textEN: style.returnToGoal(askClientType()), stage, strategy: "discovery:client_type" };
       }
-      if (askKeys.length){
-        await markAsked(sessionId, askKeys.map(k => `ask_${k}`));
-        return { textEN: discoveryAsk(persona, askKeys), stage, strategy: "discovery:ask" };
-      }
-      return { textEN: discoveryAsk(persona, miss), stage, strategy: "discovery:remind" };
     }
 
-    // demo once (different for agency vs candidate)
-    const demoShown = await wasAsked(sessionId, "demo_shown");
-    if (!demoShown.asked){
-      await markAsked(sessionId, ["demo_shown"]);
-      const textEN = profile?.lead_type === "agency" ? demoTextAgency() : demoTextCandidate();
-      return { textEN, stage, strategy: "discovery:demo" };
+    // 2) country (common for both types)
+    const countryFromMsg = detectCountryMention(userTextEN);
+    const hasCountry = profile?.country_interest || countryFromMsg;
+    if (!hasCountry){
+      const was = await wasAsked(sessionId, "ask_country");
+      if (!was.asked){
+        await markAsked(sessionId, ["ask_country"]);
+        return { textEN: style.returnToGoal(askCountry()), stage, strategy: "discovery:country" };
+      }
     }
 
-    // go next
-    await pool.query("UPDATE public.sessions SET stage='specifics', updated_at=NOW() WHERE id=$1", [sessionId]);
-    stage = "specifics";
+    // 3) branch-specific one more light question, then demo
+    if ((clientType || "").toLowerCase() === "b2b" || hasAny(userTextEN, ["agency", "recruiter"])){
+      const vol = detectCandidatesCount(userTextEN) || profile?.candidates_planned;
+      if (!vol){
+        const was = await wasAsked(sessionId, "ask_b2b_volume");
+        if (!was.asked){
+          await markAsked(sessionId, ["ask_b2b_volume"]);
+          return { textEN: style.warm(askB2BVolume()), stage, strategy: "discovery:b2b_volume" };
+        }
+      }
+      // DEMO for B2B once
+      const demoShown = await wasAsked(sessionId, "demo_shown");
+      if (!demoShown.asked){
+        await markAsked(sessionId, ["demo_shown"]);
+        return { textEN: style.warm(demoB2B()), stage, strategy: "demo:b2b" };
+      }
+      await setStage(sessionId, "specifics");
+    } else {
+      // B2C (individual)
+      const wasProfile = await wasAsked(sessionId, "ask_b2c_profile");
+      if (!wasProfile.asked && !hasAny(userTextEN, ["driver", "welder", "cook", "nurse", "programmer", "it", "builder", "warehouse", "operator"])){
+        await markAsked(sessionId, ["ask_b2c_profile"]);
+        return { textEN: style.warm(askB2CProfile()), stage, strategy: "discovery:b2c_profile" };
+      }
+      const demoShown = await wasAsked(sessionId, "demo_shown");
+      if (!demoShown.asked){
+        await markAsked(sessionId, ["demo_shown"]);
+        return { textEN: style.warm(demoB2C()), stage, strategy: "demo:b2c" };
+      }
+      await setStage(sessionId, "specifics");
+    }
   }
 
-  /* SPECIFICS — ask for confirming docs once */
+  // SPECIFICS: ask once for confirming docs and inputs
   if (stage === "specifics"){
     const asked = await wasAsked(sessionId, "specifics_ask");
     if (!asked.asked){
       await markAsked(sessionId, ["specifics_ask"]);
-      return { textEN: specificsAsk(), stage, strategy: "specifics:ask_docs" };
+      return { textEN: style.returnToGoal(askSpecificsDocs()), stage, strategy: "specifics:ask_docs" };
     }
+    // after this, general router (KB/LLM) can handle free questions
   }
 
-  return null; // let general router (KB/LLM) handle it
+  // No special playbook output → let router handle.
+  return null;
 }
