@@ -17,8 +17,8 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-// подключаем каталог
-import { findCatalogAnswer } from "./services.js";
+// каталог — только факты из catalog.json
+import { findCatalogAnswer, getCatalogSnapshot } from "./services.js";
 
 /* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
@@ -45,7 +45,7 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* ───────────────── Просьба имени ───────────────── */
+/* ───────────────── Просьба имени / приветствие ───────────────── */
 function buildAskName(userLang, rawText) {
   const hi = extractGreeting(rawText);
   const by = {
@@ -54,6 +54,17 @@ function buildAskName(userLang, rawText) {
     pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
     cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
     en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
+  };
+  return by[userLang] || by.en;
+}
+
+function buildWarmIntro(userLang) {
+  const by = {
+    ru: "Меня зовут Виктор Шиманский, я генеральный менеджер RenovoGo.com. С чем вам помочь: страна, позиция, ставка и сроки?",
+    uk: "Мене звати Віктор Шиманський, я генеральний менеджер RenovoGo.com. Чим допомогти: країна, позиція, ставка та строки?",
+    pl: "Nazywam się Wiktor Szymański, jestem general managerem RenovoGo.com. W czym pomóc: kraj, stanowisko, stawka i terminy?",
+    cz: "Jmenuji se Viktor Szymanski, general manager RenovoGo.com. S čím mohu pomoci: země, pozice, sazba a termín?",
+    en: "I’m Viktor Szymanski, GM at RenovoGo.com. How can I help: country, role, net rate and timing?"
   };
   return by[userLang] || by.en;
 }
@@ -153,6 +164,10 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
+  // Проверим: это первый ответ ассистента в этой сессии?
+  const recentRaw = await loadRecentMessages(sessionId, 4);
+  const noAssistantYet = !(recentRaw || []).some(m => m.role === "assistant");
+
   // Команды
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
@@ -201,7 +216,19 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим
+  // Если это первое обращение — сразу тёплое представление (без сухого шаблона)
+  if (noAssistantYet) {
+    const intro = buildWarmIntro(userLang);
+    const { canonical } = await toEnglishCanonical(intro);
+    await saveMessage(
+      sessionId, "assistant", canonical,
+      { category: "intro", strategy: "warm_intro" },
+      "en", userLang, intro, "intro"
+    );
+    return intro;
+  }
+
+  // Если имени ещё нет — спросим один раз и больше не дублируем
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
@@ -215,20 +242,19 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // СНАЧАЛА классифицируем интент
+  // Классификация интента
   const category = await classifyCategory(userTextRaw);
 
-  // Только эти категории разрешают вызов services (иначе — живой LLM/KB)
+  // Какие категории разрешают каталог (строго по данным)
   const SERVICES_ALLOW = new Set([
     "vacancies", "jobs", "catalog", "positions", "countries_overview", "vacancy_detail"
   ]);
 
-  // ── Catalog (короткий тизер) ──
   if (SERVICES_ALLOW.has(category)) {
     try {
-      const fromCatalog = await findCatalogAnswer(userTextRaw, userLang);
-      if (fromCatalog && typeof fromCatalog === "string" && fromCatalog.trim()) {
-        let outText = fromCatalog;
+      const teaser = await findCatalogAnswer(userTextRaw, userLang);
+      if (teaser && typeof teaser === "string" && teaser.trim()) {
+        let outText = teaser;
         const detected = await detectLanguage(outText);
         if (detected !== userLang) {
           outText = (await translateCached(outText, detected, userLang)).text;
@@ -241,14 +267,28 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
           "en", userLang, outText, "catalog"
         );
         return outText;
+      } else {
+        // Каталог не дал точного ответа: покажем безопасный обзор из snapshot
+        const snap = getCatalogSnapshot();
+        const opts = (snap.openCountries || []).join(", ");
+        const safe = opts
+          ? `Сейчас открыты направления: ${opts}. Назовите страну и позицию — вышлю условия и чек-лист.`
+          : "Набор временно закрыт. Могу поставить в приоритет и уведомить об открытии.";
+        const { canonical } = await toEnglishCanonical(safe);
+        await saveMessage(
+          sessionId, "assistant", canonical,
+          { category: "catalog", strategy: "catalog_snapshot" },
+          "en", userLang, safe, "catalog"
+        );
+        return safe;
       }
     } catch (e) {
       await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
-      // не падаем, идём дальше
+      // не падаем — продолжаем KB/LLM ниже
     }
   }
 
-  // KB → перевод → LLM fallback
+  // KB → перевод → LLM
   let kb = await kbFind(category, userLang);
   let answer, strategy = "fallback_llm", kbItemId = null;
 
