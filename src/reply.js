@@ -278,9 +278,9 @@ async function tryCatalogAnswer(sessionId, rawText, userLang) {
   return finalText;
 }
 
-/* ───────────────── Context helper: did we just ask the name? ───────────────── */
+/* ───────────────── Name helpers ───────────────── */
 
-async function askedNameRecently(sessionId, lookbackMs = 6 * 60 * 1000) {
+async function askedNameRecently(sessionId, lookbackMs = 90_000) {
   const recent = await loadRecentMessages(sessionId, 10);
   const now = Date.now();
   for (let i = recent.length - 1; i >= 0; i--) {
@@ -293,6 +293,14 @@ async function askedNameRecently(sessionId, lookbackMs = 6 * 60 * 1000) {
     }
   }
   return false;
+}
+
+function askedKeyRecentlyFromMeta(meta, key, cooldownMs = 90_000) {
+  if (!meta) return false;
+  const lastKey = meta.last_question_key;
+  const lastTs = meta.last_question_ts || 0;
+  if (lastKey !== key) return false;
+  return (Date.now() - lastTs) < cooldownMs;
 }
 
 /* ───────────────── SmartReply ───────────────── */
@@ -351,6 +359,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   // Текущая сессия
   const session = await getSession(sessionId);
+  const sessionMeta = (session && (session.meta_json || {})) || {};
 
   // Имя (умная детекция)
   const nameInfo = await detectNameSmart(userTextRaw, session?.user_name?.trim() || null);
@@ -393,16 +402,27 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     sessionId, "user", userTextEN, null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим
+  // Если имени нет — спросим (но не спамим, уважаем кулдаун)
   const knownName = (nameInfo?.name) || session?.user_name?.trim();
   if (!knownName) {
-    const askEN = buildAskName(userTextRaw, "en");
-    const { finalText } = await localizeForUser({ sessionId, userLang, textEN: askEN, prependNoticeIfNeeded: true });
-    const { canonical } = await toEnglishCanonical(finalText);
-    await saveMessage(sessionId, "assistant", canonical,
-      { category: "ask_name", strategy: "precheck_name" },
-      "en", userLang, finalText, "ask_name");
-    return finalText;
+    const recentlyAsked = askedKeyRecentlyFromMeta(sessionMeta, "ask_name", 90_000) || await askedNameRecently(sessionId, 90_000);
+    if (!recentlyAsked) {
+      const askEN = buildAskName(userTextRaw, "en");
+      const { finalText } = await localizeForUser({ sessionId, userLang, textEN: askEN, prependNoticeIfNeeded: true });
+      const { canonical } = await toEnglishCanonical(finalText);
+
+      await patchSessionMeta(sessionId, {
+        asked: { ...(sessionMeta.asked || {}), ask_name: true },
+        last_question_key: "ask_name",
+        last_question_ts: Date.now()
+      });
+
+      await saveMessage(sessionId, "assistant", canonical,
+        { category: "ask_name", strategy: "precheck_name" },
+        "en", userLang, finalText, "ask_name");
+      return finalText;
+    }
+    // если только что спрашивали — не повторяем; продолжаем диалог
   }
 
   // Оркестратор — решаем следующий шаг
@@ -438,7 +458,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   } catch (_) {}
 
-  // Каталог (только если не заблокирован оркестратором)
+  // Каталог (только если не заблокирован)
   try {
     if (!step?.blockCatalog) {
       const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
@@ -480,6 +500,9 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   const { canonical: ansEN } = await toEnglishCanonical(finalText);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
+  // на всякий случай добиваем сохранение последних меток шага
+  if (step?.metaPatch) { try { await patchSessionMeta(sessionId, step.metaPatch); } catch {} }
+
   await saveMessage(
     sessionId, "assistant", ansEN,
     { category, strategy, ...(step?.metaPatch || {}) },
