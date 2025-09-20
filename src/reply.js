@@ -17,9 +17,10 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
+import { findCatalogAnswer } from "./services.js";
+
 /* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
-  // Историю приводим к безопасному формату {role, content}
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -38,9 +39,7 @@ async function replyCore(sessionId, userTextEN) {
   messages.push(...recent);
   messages.push({ role: "user", content: userTextEN });
 
-  // Внутренняя страховка: удаляем любые посторонние поля
   const safe = messages.map(m => ({ role: m.role, content: m.content }));
-
   const { text } = await runLLM(safe);
   return text;
 }
@@ -67,8 +66,7 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   if (!text || text.length < 2) {
     const msg = "Нужен текст после команды «Переведи».";
     const { canonical } = await toEnglishCanonical(msg);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "translate", strategy: "cmd_translate_error" },
       "en", userLang, msg, "translate"
     );
@@ -86,8 +84,7 @@ ${styled}
 ${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: "translate", strategy: "cmd_translate" },
     "en", userLang, combined, "translate"
   );
@@ -100,8 +97,7 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   if (!taught) {
     const msg = "Нужен текст после «Ответил бы».";
     const { canonical } = await toEnglishCanonical(msg);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "teach", strategy: "cmd_teach_error" },
       "en", userLang, msg, "teach"
     );
@@ -112,8 +108,7 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
 
   const out = `✅ В базу добавлено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: lastCat, strategy: "cmd_teach", kb_id: kbId },
     "en", userLang, out, lastCat
   );
@@ -128,14 +123,11 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
       ? (await translateCached(kb.answer, "ru", userLang)).text
       : kb.answer;
   } else {
-    answer = await replyCore(
-      sessionId,
-      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA."
-    );
+    answer = await replyCore(sessionId, "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA.");
   }
+
   const { canonical } = await toEnglishCanonical(answer);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: "expensive", strategy: "cmd_answer_expensive" },
     "en", userLang, answer, "expensive"
   );
@@ -148,15 +140,13 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канонизируем вход
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // Команды (сырые — внутри парсеры сами чистят)
+  // Команды
   if (isCmdTeach(userTextRaw)) {
-    const msgId = await saveMessage(
-      sessionId, "user", userTextEN,
+    const msgId = await saveMessage(sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "teach" },
       "en", userLang, origText, null
     );
@@ -168,8 +158,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   if (isCmdTranslate(userTextRaw)) {
     const { text: t } = parseCmdTranslate(userTextRaw);
     if (t && t.length >= 2) {
-      const msgId = await saveMessage(
-        sessionId, "user", userTextEN,
+      const msgId = await saveMessage(sessionId, "user", userTextEN,
         { kind: "cmd_detected", cmd: "translate" },
         "en", userLang, origText, null
       );
@@ -180,8 +169,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   }
 
   if (isCmdAnswerExpensive(userTextRaw)) {
-    const msgId = await saveMessage(
-      sessionId, "user", userTextEN,
+    const msgId = await saveMessage(sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "answer_expensive" },
       "en", userLang, origText, null
     );
@@ -190,34 +178,40 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // Имя / телефон
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // Сохраняем вход пользователя
-  const userMsgId = await saveMessage(
-    sessionId, "user", userTextEN,
+  const userMsgId = await saveMessage(sessionId, "user", userTextEN,
     null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
     const ask = buildAskName(userLang, userTextRaw);
     const { canonical } = await toEnglishCanonical(ask);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "ask_name", strategy: "precheck_name" },
       "en", userLang, ask, "ask_name"
     );
     return ask;
   }
 
-  // Классификация → KB → LLM
-  const category = await classifyCategory(userTextRaw);
+  // ⬇️ NEW: Проверка вакансий
+  const fromCatalog = await findCatalogAnswer(userTextEN, userLang);
+  if (fromCatalog) {
+    const { canonical: ansEN } = await toEnglishCanonical(fromCatalog);
+    await saveMessage(sessionId, "assistant", ansEN,
+      { category: "catalog", strategy: "from_catalog" },
+      "en", userLang, fromCatalog, "catalog"
+    );
+    await logReply(sessionId, "catalog", "auto", null, userMsgId, "trigger: services.js");
+    return fromCatalog;
+  }
 
+  // Стандартная классификация
+  const category = await classifyCategory(userTextRaw);
   let kb = await kbFind(category, userLang);
   let answer, strategy = "fallback_llm", kbItemId = null;
 
@@ -244,8 +238,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   const { canonical: ansEN } = await toEnglishCanonical(answer);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
-  await saveMessage(
-    sessionId, "assistant", ansEN,
+  await saveMessage(sessionId, "assistant", ansEN,
     { category, strategy },
     "en", userLang, answer, category
   );
