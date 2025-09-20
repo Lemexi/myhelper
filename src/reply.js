@@ -61,8 +61,12 @@ function buildAskName(userLang, rawText) {
 /* ───────────────── Команды ───────────────── */
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
+  // Разбираем команду
   const { targetLangWord, text } = parseCmdTranslate(rawText);
-  const targetLang = (targetLangWord || "en").toLowerCase();
+
+  // ⛳️ Требование Виктора: если язык не указан → по умолчанию EN
+  // Если указан — уважаем указанный (например, "переведи на pl: ...").
+  const targetLang = (targetLangWord ? targetLangWord : "en").toLowerCase();
 
   if (!text || text.length < 2) {
     const msg = "Нужен текст после команды «Переведи».";
@@ -75,8 +79,14 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
+  // 🧠 Перевод с усилением стиля (психология влияния, маркетинг, нейрокопирайтинг)
+  // Параметр style передаём — если translateWithStyle его игнорирует, он не навредит.
   const { targetLang: tgt, styled, styledRu } =
-    await translateWithStyle({ sourceText: text, targetLang });
+    await translateWithStyle({
+      sourceText: text,
+      targetLang,
+      style: "influence_psychology_marketing_neurocopy"
+    });
 
   const combined =
 `🔍 Перевод (${tgt.toUpperCase()}):
@@ -163,7 +173,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
-  }
+    }
 
   if (isCmdTranslate(userTextRaw)) {
     const { text: t } = parseCmdTranslate(userTextRaw);
@@ -176,6 +186,16 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
+    } else {
+      // Поймали команду без текста → отдадим челночный ответ об ошибке
+      const msg = "Нужен текст после команды «Переведи».";
+      const { canonical } = await toEnglishCanonical(msg);
+      await saveMessage(
+        sessionId, "assistant", canonical,
+        { category: "translate", strategy: "cmd_translate_error" },
+        "en", userLang, msg, "translate"
+      );
+      return msg;
     }
   }
 
