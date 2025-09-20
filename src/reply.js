@@ -17,9 +17,14 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
+// 🔗 Новый модуль каталога услуг/вакансий/цен
+// Ожидается файл /src/services.js, который экспортирует:
+// - findCatalogAnswer(rawText: string, userLang: string) -> Promise<{answer: string, meta?:object}|null>
+// - enrichExpensiveAnswer(baseText: string, userLang: string) -> Promise<string>
+import { findCatalogAnswer, enrichExpensiveAnswer } from "./services.js";
+
 /* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
-  // Историю приводим к безопасному формату {role, content}
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -38,9 +43,7 @@ async function replyCore(sessionId, userTextEN) {
   messages.push(...recent);
   messages.push({ role: "user", content: userTextEN });
 
-  // Внутренняя страховка: удаляем любые посторонние поля
   const safe = messages.map(m => ({ role: m.role, content: m.content }));
-
   const { text } = await runLLM(safe);
   return text;
 }
@@ -61,11 +64,7 @@ function buildAskName(userLang, rawText) {
 /* ───────────────── Команды ───────────────── */
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
-  // Разбираем команду
   const { targetLangWord, text } = parseCmdTranslate(rawText);
-
-  // ⛳️ Требование Виктора: если язык не указан → по умолчанию EN
-  // Если указан — уважаем указанный (например, "переведи на pl: ...").
   const targetLang = (targetLangWord ? targetLangWord : "en").toLowerCase();
 
   if (!text || text.length < 2) {
@@ -79,8 +78,6 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     return msg;
   }
 
-  // 🧠 Перевод с усилением стиля (психология влияния, маркетинг, нейрокопирайтинг)
-  // Параметр style передаём — если translateWithStyle его игнорирует, он не навредит.
   const { targetLang: tgt, styled, styledRu } =
     await translateWithStyle({
       sourceText: text,
@@ -143,6 +140,12 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
       "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA."
     );
   }
+
+  // 💡 Добиваем конкретикой из каталога (цены/вилки/условия), если доступно
+  try {
+    answer = await enrichExpensiveAnswer(answer, userLang);
+  } catch (_) { /* мягкий фолбэк */ }
+
   const { canonical } = await toEnglishCanonical(answer);
   await saveMessage(
     sessionId, "assistant", canonical,
@@ -150,6 +153,26 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     "en", userLang, answer, "expensive"
   );
   await logReply(sessionId, "cmd", "expensive", kb?.id || null, null, "trigger: answer expensive");
+  return answer;
+}
+
+/* ───────────────── Каталог (услуги/вакансии/цены) ───────────────── */
+
+async function tryCatalogAnswer(sessionId, rawText, userLang) {
+  // Пытаемся получить прямой ответ из каталога (по стране/компании/позиции/цене)
+  const hit = await findCatalogAnswer(rawText, userLang);
+  if (!hit || !hit.answer) return null;
+
+  const { answer, meta } = hit;
+  const { canonical } = await toEnglishCanonical(answer);
+
+  await saveMessage(
+    sessionId, "assistant", canonical,
+    { category: "catalog", strategy: "catalog_hit", meta: meta || null },
+    "en", userLang, answer, "catalog"
+  );
+  await logReply(sessionId, "catalog", "catalog", null, null, meta ? JSON.stringify(meta) : null);
+
   return answer;
 }
 
@@ -163,7 +186,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // Команды (сырые — внутри парсеры сами чистят)
+  // Команды
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -173,7 +196,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
-    }
+  }
 
   if (isCmdTranslate(userTextRaw)) {
     const { text: t } = parseCmdTranslate(userTextRaw);
@@ -187,7 +210,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     } else {
-      // Поймали команду без текста → отдадим челночный ответ об ошибке
       const msg = "Нужен текст после команды «Переведи».";
       const { canonical } = await toEnglishCanonical(msg);
       await saveMessage(
@@ -233,6 +255,14 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       "en", userLang, ask, "ask_name"
     );
     return ask;
+  }
+
+  // 🆕 Попытка ответить из каталога услуг/вакансий/цен
+  try {
+    const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
+    if (catAns) return catAns;
+  } catch (_) {
+    // мягкий фолбэк — никаких исключений наружу
   }
 
   // Классификация → KB → LLM
