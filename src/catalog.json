@@ -1,67 +1,152 @@
 {
-  "pricing": {
-    "service_fee": {
-      "cz": {
-        "work_permit": "€270",
-        "contract_setup": "€150",
-        "full_package": "€420"
-      },
-      "pl": {
-        "work_permit": "€250",
-        "contract_setup": "€120",
-        "full_package": "€370"
-      }
+  "country_pages": {
+    "CZ": {
+      "demand": "https://renovogo.com/czech/demand",
+      "contract": "https://renovogo.com/czech/contract"
     },
-    "by_position": {
-      "warehouse": {
-        "candidate_onboarding": "€90",
-        "docs_check": "€60"
-      },
-      "welder": {
-        "candidate_onboarding": "€120",
-        "docs_check": "€80"
-      }
+    "PL": {
+      "demand": "https://renovogo.com/poland/demand",
+      "contract": "https://renovogo.com/poland/contract"
+    },
+    "RS": {
+      "demand": "https://renovogo.com/serbia/demand",
+      "contract": "https://renovogo.com/serbia/contract"
     }
   },
+
+  "pricing": {
+    "service_packages": {
+      "CZ": [
+        { "name": "Legal support to obtain an employment contract – 3 months",  "initial": 270, "final": 150, "currency": "EUR" },
+        { "name": "Legal support to obtain an employment contract – 6 months",  "initial": 300, "final": 150, "currency": "EUR" },
+        { "name": "Legal support to obtain an employment contract – 9 months",  "initial": 350, "final": 150, "currency": "EUR" },
+        { "name": "Legal support to obtain an employment contract – 24 months", "initial": 350, "final": 350, "currency": "EUR", "note": "recommended for TRC eligibility" }
+      ],
+      "PL": [
+        { "name": "Legal support to obtain an employment contract (Type A, 12 months)", "initial": 350, "final": 350, "currency": "EUR" }
+      ]
+    },
+    "embassy_appointment": {
+      "CZ": { "initial": 250, "final": 250, "currency": "EUR" },
+      "PL": { "initial": 250, "final": 250, "currency": "EUR" }
+    }
+  },
+
   "vacancies": [
     {
-      "country": "CZ",
-      "company": "Eurostart s.r.o.",
-      "city": "Praha",
-      "position": "Warehouse / Auxiliary",
-      "salary_net": { "min": 1100, "max": 2100, "currency": "EUR" },
-      "hours_per_month": "200–250",
-      "schedule": "5–6 days/week, 8–12 hrs/day",
-      "accommodation": { "provided": true, "cost_per_month": 200 },
-      "transport_to_work": true,
-      "meals_provided": false,
-      "notes": "Men & women 18–50; no prior experience"
-    },
-    {
-      "country": "CZ",
-      "company": "TechWeld s.r.o.",
-      "city": "Brno",
-      "position": "Welder (MIG/MAG)",
-      "salary_net": { "min": 1600, "max": 2500, "currency": "EUR" },
-      "hours_per_month": "200–240",
-      "schedule": "5 days/week, 10–12 hrs/day",
-      "accommodation": { "provided": true, "cost_per_month": 230 },
-      "transport_to_work": true,
-      "meals_provided": false,
-      "notes": "Experience with MIG/MAG required"
-    },
-    {
+      "active": true,
       "country": "PL",
-      "company": "LogiPack Sp. z o.o.",
+      "company": "GROUP SERVICE PL Sp. z o.o.",
       "city": "Wrocław",
-      "position": "Warehouse / Picker",
-      "salary_net": { "min": 950, "max": 1600, "currency": "EUR" },
-      "hours_per_month": "180–220",
-      "schedule": "5–6 days/week, 8–10 hrs/day",
-      "accommodation": { "provided": false, "cost_per_month": 0 },
+      "position": "Painter-plasterer / Helper",
+      "sex": "Male",
+      "age": "18–45",
+      "employment_period": "Type A (12 months)",
+      "salary_text": "from 5000 PLN net + piecework (from 220+ PLN per m²)",
+      "hours_per_month": null,
+      "schedule": "6 days/week",
+      "accommodation": { "provided": true, "cost_per_month": 300, "note": "employee pays ~€300–350/month" },
+      "transport_to_work": "independently (travel document issued by the employer)",
+      "meals_provided": false,
+      "notes": "Finishing works, OHS/HSE compliance mandatory"
+    },
+
+    {
+      "active": true,
+      "country": "CZ",
+      "company": "ALVI DEVELOPMENT s.r.o.",
+      "city": "Prague",
+      "position": "Warehouse / Production Worker (forest works)",
+      "sex": "Male/Female",
+      "age": "18–60",
+      "employees_needed": 170,
+      "employment_period": "3 / 6 / 9 / 24 months",
+      "contract_type": "Working contract",
+      "salary_text": "from 24,000 CZK net",
+      "hourly_rate": "from 200/260 CZK per hour",
+      "workhours_monthly": "240+",
+      "workday": "Mon–Fri",
+      "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
+      "transport_to_work": true,
+      "meals_provided": false,
+      "notes": "Trail clearing, bushes trimming, planting support, seasonal forestry assistance"
+    },
+    {
+      "active": true,
+      "country": "CZ",
+      "company": "BEST LEVEL s.r.o.",
+      "city": "Prague",
+      "position": "Warehouse Worker / Auxiliary Worker / Production Worker",
+      "sex": "Male/Female",
+      "age": "18–60",
+      "employees_needed": 195,
+      "employment_period": "3 / 6 / 9 / 24 months",
+      "contract_type": "Working contract",
+      "salary_text": "from 22,400 CZK net",
+      "hourly_rate": "from 200/260 CZK per hour",
+      "workhours_monthly": "240+",
+      "workday": "Mon–Fri",
+      "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
+      "transport_to_work": true,
+      "meals_provided": false,
+      "notes": "Warehouse & production: sorting, packing, marking"
+    },
+    {
+      "active": true,
+      "country": "CZ",
+      "company": "FORTUNA HOLDING s.r.o.",
+      "city": "Prague",
+      "position": "Warehouse / Production Worker",
+      "sex": "Male/Female",
+      "age": "18–60",
+      "employees_needed": 210,
+      "employment_period": "3 / 6 / 9 / 24 months",
+      "contract_type": "Working contract",
+      "salary_text": "from 22,400 CZK net",
+      "hourly_rate": "from 200/260 CZK per hour",
+      "workhours_monthly": "240+",
+      "workday": "Mon–Fri",
+      "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
+      "transport_to_work": true,
+      "meals_provided": false,
+      "notes": "Storage, plastic goods warehousing, sorting/packing, documentation"
+    },
+    {
+      "active": true,
+      "country": "CZ",
+      "company": "TEPROPRINT PRODUCTS AB s.r.o.",
+      "city": "Prague",
+      "position": "Construction Helper / Production Worker",
+      "sex": "Male/Female",
+      "age": "18–55",
+      "employees_needed": 130,
+      "employment_period": "3 / 6 / 9 / 24 months",
+      "contract_type": "Working contract",
+      "salary_text": "from 22,400 CZK net",
+      "hourly_rate": "from 200/260 CZK per hour",
+      "workhours_monthly": "240+",
+      "workday": "Mon–Fri",
+      "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
+      "transport_to_work": true,
+      "meals_provided": false,
+      "notes": "Cleaning buildings, preparing objects, auxiliary construction tasks"
+    },
+
+    {
+      "active": false,
+      "country": "RS",
+      "company": "TBD (Serbia)",
+      "city": "Belgrade",
+      "position": "Warehouse / Helper",
+      "sex": "Male/Female",
+      "age": "18–55",
+      "employment_period": "TBD",
+      "salary_text": "TBD",
+      "workhours_monthly": "TBD",
+      "accommodation": { "provided": true, "cost_per_month": null, "note": "TBD" },
       "transport_to_work": false,
       "meals_provided": false,
-      "notes": "Basic Polish or English preferred"
+      "notes": "Will be added after Demand Letter confirmation"
     }
   ]
 }
