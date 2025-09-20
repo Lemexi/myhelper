@@ -402,7 +402,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     sessionId, "user", userTextEN, null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим (но не спамим, уважаем кулдаун)
+  // Если имени нет — спросим (не спамим)
   const knownName = (nameInfo?.name) || session?.user_name?.trim();
   if (!knownName) {
     const recentlyAsked = askedKeyRecentlyFromMeta(sessionMeta, "ask_name", 90_000) || await askedNameRecently(sessionId, 90_000);
@@ -422,10 +422,9 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
         "en", userLang, finalText, "ask_name");
       return finalText;
     }
-    // если только что спрашивали — не повторяем; продолжаем диалог
   }
 
-  // Оркестратор — решаем следующий шаг
+  // Оркестратор — решаем следующий шаг (учитывает «живость», nudgeEN и блок каталога)
   let step = null;
   try {
     step = await decideNextStep({ session, text: userTextRaw, snapshot: getCatalogSnapshot() });
@@ -433,6 +432,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       try { await patchSessionMeta(sessionId, step.metaPatch); } catch {}
     }
 
+    // Жёсткий вопрос (критичный шаг)
     if (step?.questionEN) {
       const { finalText, metaExtra } = await localizeForUser({
         sessionId, userLang, textEN: step.questionEN, prependNoticeIfNeeded: true
@@ -446,6 +446,23 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       return finalText;
     }
 
+    // Мягкий мостик: сначала коротко отвечаем по теме, затем добавляем nudge
+    if (step?.nudgeEN) {
+      let briefEN = await replyCore(sessionId, userTextEN);
+      if (briefEN && briefEN.length > 700) briefEN = briefEN.slice(0, 650) + "…";
+      const stitchedEN = briefEN ? `${briefEN}\n\n${step.nudgeEN}` : step.nudgeEN;
+
+      const { finalText, metaExtra } = await localizeForUser({
+        sessionId, userLang, textEN: stitchedEN, prependNoticeIfNeeded: true
+      });
+      const { canonical } = await toEnglishCanonical(finalText);
+      await saveMessage(sessionId, "assistant", canonical,
+        { category: "orchestrator", strategy: "nudge_bridge", ...(step.metaPatch || {}), ...(metaExtra || {}) },
+        "en", userLang, finalText, "orchestrator");
+      return finalText;
+    }
+
+    // Если каталог блокирован — отвечаем коротко, без каталога
     if (step?.blockCatalog) {
       let briefEN = await replyCore(sessionId, userTextEN);
       if (briefEN && briefEN.length > 900) briefEN = briefEN.slice(0, 850) + "…";
@@ -458,7 +475,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   } catch (_) {}
 
-  // Каталог (только если не заблокирован)
+  // Каталог (если не заблокирован)
   try {
     if (!step?.blockCatalog) {
       const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
@@ -500,7 +517,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   const { canonical: ansEN } = await toEnglishCanonical(finalText);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
-  // на всякий случай добиваем сохранение последних меток шага
+
   if (step?.metaPatch) { try { await patchSessionMeta(sessionId, step.metaPatch); } catch {} }
 
   await saveMessage(
