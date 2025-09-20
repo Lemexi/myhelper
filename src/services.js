@@ -1,19 +1,44 @@
 // /src/services.js
 // Catalog-driven answers (vacancies, pricing, links) — user-facing text in EN.
-// Strictly "legal support" wording. Shows only active directions.
-// If user mentions 2+ candidates, calculates upfront/final totals.
+// Strict legal wording (“legal support”), only active directions are shown.
+// Video interview / video resume requirements are supported per vacancy.
+// If user mentions multiple candidates (e.g., “x5”, “5 candidates”), we multiply upfront/final.
+// Exports:
+//   - findCatalogAnswer(rawText, userLang?) -> {answer, meta}|null
+//   - enrichExpensiveAnswer(baseText, userLang?) -> string
+//   - getCatalogSnapshot() -> { sig: string, openCountries: string[] }
 
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 const CATALOG_PATH = path.join(__dirname, "catalog.json");
 
-let CACHE = { mtimeMs: 0, data: null };
+let CACHE = { mtimeMs: 0, data: null, sig: "" };
 
 function safeJSONParse(txt) { try { return JSON.parse(txt); } catch { return null; } }
+
+function computeSig(obj) {
+  // Stable signature of the parts that affect offers (vacancies+pricing+pages)
+  const payload = JSON.stringify({
+    pricing: obj?.pricing || {},
+    vacancies: (obj?.vacancies || []).map(v => ({
+      active: !!v.active,
+      country: v.country, company: v.company, position: v.position,
+      sex: v.sex, age: v.age,
+      salary_text: v.salary_text, salary_net: v.salary_net, salary_gross: v.salary_gross,
+      hourly_rate: v.hourly_rate,
+      accommodation: v.accommodation,
+      interview: v.interview || null
+    })),
+    country_pages: obj?.country_pages || {}
+  });
+  return crypto.createHash("sha1").update(payload).digest("hex");
+}
+
 function loadCatalog() {
   try {
     const stat = fs.statSync(CATALOG_PATH);
@@ -21,7 +46,7 @@ function loadCatalog() {
       const raw = fs.readFileSync(CATALOG_PATH, "utf8");
       const data = safeJSONParse(raw);
       if (data && typeof data === "object") {
-        CACHE = { mtimeMs: stat.mtimeMs, data };
+        CACHE = { mtimeMs: stat.mtimeMs, data, sig: computeSig(data) };
       } else {
         console.warn("[services] catalog.json parse failed; keeping old cache");
       }
@@ -29,7 +54,15 @@ function loadCatalog() {
   } catch (e) {
     console.warn("[services] catalog.json not found or unreadable:", e?.message);
   }
-  return CACHE.data || { pricing: {}, vacancies: [], country_pages: {} };
+  if (!CACHE.data) CACHE = { mtimeMs: 0, data: { pricing: {}, vacancies: [], country_pages: {} }, sig: "" };
+  return CACHE.data;
+}
+
+export function getCatalogSnapshot() {
+  const data = loadCatalog();
+  const open = new Set();
+  for (const v of (data.vacancies || [])) if (v.active) open.add((v.country || "").toUpperCase());
+  return { sig: CACHE.sig, openCountries: Array.from(open) };
 }
 
 function norm(t) { return String(t || "").toLowerCase().replace(/\s+/g, " ").trim(); }
@@ -40,7 +73,7 @@ const COUNTRY_MAP = [
   { code: "CZ", keywords: ["cz", "czech", "czechia", "czech republic", "чех", "чехия", "чеськ"] },
   { code: "PL", keywords: ["pl", "poland", "polska", "польша", "польск"] },
   { code: "RS", keywords: ["rs", "serbia", "srbija", "сербия"] },
-  { code: "LT", keywords: ["lt", "lithuania", "liet", "lietuva", "литва"] },
+  { code: "LT", keywords: ["lt", "lithuania", "lietuva", "литва"] },
   { code: "LV", keywords: ["lv", "latvia", "latvija", "латв"] },
   { code: "SK", keywords: ["sk", "slovakia", "slovensko", "словаки"] }
 ];
@@ -56,7 +89,7 @@ const POSITION_SYNONYMS = {
   welder:    ["welder", "welding", "сварщик", "mig", "mag", "tig", "svarka"],
   loader:    ["loader", "грузчик", "докер"],
   cook:      ["cook", "kitchen", "повар", "кухня"],
-  painter:   ["painter", "plasterer", "маляр", "штукатур", "маляр-штукатур", "finishing"],
+  painter:   ["painter", "plasterer", "маляр", "штукатур", "finishing"],
   helper:    ["helper", "подсоб", "помощник", "laborer"]
 };
 function detectPosition(text) {
@@ -81,9 +114,7 @@ function detectCompany(text, companies) {
 
 function getAvailableCountries(catalog) {
   const set = new Set();
-  for (const v of (catalog.vacancies || [])) {
-    if (v.active) set.add((v.country || "").toUpperCase());
-  }
+  for (const v of (catalog.vacancies || [])) if (v.active) set.add((v.country || "").toUpperCase());
   return Array.from(set);
 }
 
@@ -96,13 +127,11 @@ function listPositionsInCountry(list) {
 
 // ---------- Pricing helpers ----------
 function fmtMoney(amount, currency = "EUR") {
-  // Simple pretty-print, assuming EUR
   const prefix = currency === "EUR" ? "€" : "";
   return `${prefix}${amount}`;
 }
 
 function extractCandidateCount(rawText) {
-  // Look for explicit counts: "5 candidates", "5 people", "5 человек/кандидатов", "x5"
   const t = norm(rawText);
   const m1 = t.match(/(\d{1,3})\s*(candidates?|people|persons?|кандидат(ов|а|ы)?|челов(ек|ека|еки))/i);
   if (m1) return Math.max(1, parseInt(m1[1], 10));
@@ -111,12 +140,11 @@ function extractCandidateCount(rawText) {
   return 1;
 }
 
-function formatServicePackages(pricingObj, countryCode, positionKeyOrName, candidateCount = 1) {
+function formatServicePackages(pricingObj, countryCode, candidateCount = 1) {
   if (!pricingObj) return null;
   const c = countryCode ? countryCode.toUpperCase() : null;
   let lines = [];
 
-  // Country service packages (split prices)
   if (c && pricingObj.service_packages && pricingObj.service_packages[c]) {
     const pkgs = pricingObj.service_packages[c];
     lines.push(`• Service packages (${c}):`);
@@ -132,9 +160,8 @@ function formatServicePackages(pricingObj, countryCode, positionKeyOrName, candi
         lines.push(`     ↳ For ${candidateCount} candidates: upfront ${initTot}, final ${finTot} (total ${allTot}).`);
       }
     }
+    lines.push("• Prices are for legal support per candidate (not document sales). Final fee is due after PDF is issued.");
   }
-
-  // Embassy appointment option
   if (c && pricingObj.embassy_appointment && pricingObj.embassy_appointment[c]) {
     const ea = pricingObj.embassy_appointment[c];
     const eaInit = fmtMoney(ea.initial, ea.currency);
@@ -147,12 +174,6 @@ function formatServicePackages(pricingObj, countryCode, positionKeyOrName, candi
       lines.push(`  ↳ For ${candidateCount} candidates: upfront ${initTot}, final ${finTot} (total ${allTot}).`);
     }
   }
-
-  // Legal phrasing
-  if (lines.length) {
-    lines.push("• Prices are for legal support per candidate (not document sales). Final fee is due after PDF is issued.");
-  }
-
   return lines.length ? lines.join("\n") : null;
 }
 
@@ -196,6 +217,34 @@ function formatMeals(v) {
   return "to be confirmed";
 }
 
+function formatInterview(v) {
+  const i = v.interview || {};
+  // employer_video_required: boolean | "optional"
+  // candidate_video_resume_required: boolean
+  // portfolio_video_required: boolean
+  // notes?: string
+  function reqToText(flag, optionalText = "optional (we can arrange on request)") {
+    if (flag === true) return "required";
+    if (flag === false) return "not required";
+    if (flag === "optional") return optionalText;
+    return "to be confirmed";
+    }
+  const rows = [];
+  if (i.employer_video_required !== undefined) {
+    rows.push(`• Employer video interview: ${reqToText(i.employer_video_required)}`);
+  } else {
+    rows.push(`• Employer video interview: optional (we can arrange on request)`);
+  }
+  if (i.candidate_video_resume_required !== undefined) {
+    rows.push(`• Candidate video résumé: ${reqToText(i.candidate_video_resume_required)}`);
+  }
+  if (i.portfolio_video_required !== undefined) {
+    rows.push(`• Video of recent works: ${reqToText(i.portfolio_video_required)}`);
+  }
+  if (i.notes) rows.push(`• Interview notes: ${i.notes}`);
+  return rows.join("\n");
+}
+
 function formatVacancy(v, countryPages = {}) {
   const sal = formatSalary(v);
   const acc = formatAccommodation(v);
@@ -219,6 +268,9 @@ function formatVacancy(v, countryPages = {}) {
     `• Transport: ${transport}`,
     `• Meals: ${meals}`
   ].filter(Boolean);
+
+  // Interview requirements (always show a friendly line)
+  lines.push(formatInterview(v));
 
   if (v.notes) lines.push(`• Notes: ${v.notes}`);
   if (linkDemand) lines.push(`🔗 Demand page: ${linkDemand}`);
@@ -267,7 +319,7 @@ export async function findCatalogAnswer(rawText, _userLang = "en") {
     const linkDemand = countryPages[country]?.demand ? `\nDocs page: ${countryPages[country].demand}` : "";
     return {
       answer: `The ${country} direction is currently closed. ${alt}${linkDemand}`,
-      meta: { mode: "country_closed", country }
+      meta: { mode: "country_closed", country, snapshot: getCatalogSnapshot() }
     };
   }
 
@@ -284,19 +336,19 @@ export async function findCatalogAnswer(rawText, _userLang = "en") {
     }
     return {
       answer: `Currently open directions:\n\n${perCountry.join("\n\n")}\n\nTell me a country and position — I’ll send full terms and the Demand page.`,
-      meta: { mode: "all_countries_overview", availableCountries }
+      meta: { mode: "all_countries_overview", availableCountries, snapshot: getCatalogSnapshot() }
     };
   }
 
   // "What do you have?" without country → ask to choose from available
   if (asksWhat && !country) {
     if (!availableCountries.length) {
-      return { answer: "Recruitment is temporarily closed. I can put you on priority and notify when it opens.", meta: { mode: "all_closed" } };
+      return { answer: "Recruitment is temporarily closed. I can put you on priority and notify when it opens.", meta: { mode: "all_closed", snapshot: getCatalogSnapshot() } };
     }
     const opts = availableCountries.join(", ");
     return {
       answer: `Open now: ${opts}. Are you interested in Czech Republic, Poland, or Serbia? (Once you choose, I’ll send companies, roles, salaries and the Demand page.)`,
-      meta: { mode: "ask_country", availableCountries }
+      meta: { mode: "ask_country", availableCountries, snapshot: getCatalogSnapshot() }
     };
   }
 
@@ -318,7 +370,7 @@ export async function findCatalogAnswer(rawText, _userLang = "en") {
         "",
         "Tell me the exact position or company — I’ll send full details and prices."
       ].filter(Boolean);
-      return { answer: lines.join("\n"), meta: { country, mode: "country_overview" } };
+      return { answer: lines.join("\n"), meta: { country, mode: "country_overview", snapshot: getCatalogSnapshot() } };
     }
   }
 
@@ -326,7 +378,7 @@ export async function findCatalogAnswer(rawText, _userLang = "en") {
   if (matches.length >= 2) {
     const top = pickTop(matches, 2);
     const blocks = top.map(v => formatVacancy(v, countryPages));
-    const pkgBlock = formatServicePackages(catalog.pricing, country || (top[0]?.country), positionKey, candidateCount);
+    const pkgBlock = formatServicePackages(catalog.pricing, country || (top[0]?.country), candidateCount);
     const msg =
 `I found several options${country ? ` for ${country}` : ""}${companyName ? ` (company: ${companyName})` : ""}${positionKey ? ` (position: ${positionKey})` : ""}:
 
@@ -334,21 +386,21 @@ ${blocks.join("\n\n")}
 ${pkgBlock ? ("\n" + pkgBlock + "\n") : ""}
 
 Need details for one of these companies? Tell me the name — I’ll send a checklist and the Demand page.`;
-    return { answer: msg, meta: { country, companyName, positionKey, total: matches.length, mode: "multi", candidateCount } };
+    return { answer: msg, meta: { country, companyName, positionKey, total: matches.length, candidateCount, mode: "multi", snapshot: getCatalogSnapshot() } };
   }
 
   // Single match → full block + pricing/packages + country links
   if (matches.length === 1) {
     const v = matches[0];
     const block = formatVacancy(v, countryPages);
-    const priceBlock = formatServicePackages(catalog.pricing, v.country, v.position || positionKey, candidateCount);
+    const priceBlock = formatServicePackages(catalog.pricing, v.country, candidateCount);
     const contractLink = countryPages[(v.country || "").toUpperCase()]?.contract;
     const msg =
 `${block}
 ${priceBlock ? ("\n" + priceBlock) : ""}${contractLink ? `\n• Sample employment contract: ${contractLink}` : ""}
 
 If this fits, I’ll send the document checklist and we can start the registration.`;
-    return { answer: msg, meta: { country: v.country, companyName: v.company || null, position: v.position || positionKey, mode: "single", candidateCount } };
+    return { answer: msg, meta: { country: v.country, companyName: v.company || null, position: v.position || positionKey, candidateCount, mode: "single", snapshot: getCatalogSnapshot() } };
   }
 
   // Nothing confident from catalog
