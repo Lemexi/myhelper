@@ -17,12 +17,11 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-// 🔗 мягкая интеграция каталога (НЕ ломает остальную логику)
+// подключаем каталог
 import { findCatalogAnswer } from "./services.js";
 
 /* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
-  // Историю приводим к безопасному формату {role, content}
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -41,9 +40,7 @@ async function replyCore(sessionId, userTextEN) {
   messages.push(...recent);
   messages.push({ role: "user", content: userTextEN });
 
-  // Внутренняя страховка: удаляем любые посторонние поля
   const safe = messages.map(m => ({ role: m.role, content: m.content }));
-
   const { text } = await runLLM(safe);
   return text;
 }
@@ -156,7 +153,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     await toEnglishCanonical(userTextRaw);
   const userLang = srcLang || userLangHint;
 
-  // Команды (сырые — внутри парсеры сами чистят)
+  // Команды
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -218,37 +215,40 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  /* ─────────────── Catalog (soft hint) ───────────────
-     Если запрос явно про вакансии/прайс/страны — services вернёт компактный текст.
-     Мы НЕ ломаем общую логику: если services ничего не даёт — идём по KB/LLM.
-  */
-  try {
-    const fromCatalog = await findCatalogAnswer(userTextRaw, userLang);
-    if (fromCatalog && typeof fromCatalog === "string" && fromCatalog.trim().length > 0) {
-      // Переводим под язык пользователя (services отвечает EN)
-      let outText = fromCatalog;
-      const detected = await detectLanguage(outText);
-      if (detected !== userLang) {
-        outText = (await translateCached(outText, detected, userLang)).text;
-      }
-
-      const { canonical } = await toEnglishCanonical(outText);
-      await logReply(sessionId, "services_hint", "catalog", null, userMsgId, null);
-      await saveMessage(
-        sessionId, "assistant", canonical,
-        { category: "catalog", strategy: "services_hint" },
-        "en", userLang, outText, "catalog"
-      );
-      return outText;
-    }
-  } catch (e) {
-    // Никогда не роняем поток из-за services: просто продолжаем KB/LLM
-    await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
-  }
-
-  // Классификация → KB → LLM
+  // СНАЧАЛА классифицируем интент
   const category = await classifyCategory(userTextRaw);
 
+  // Только эти категории разрешают вызов services (иначе — живой LLM/KB)
+  const SERVICES_ALLOW = new Set([
+    "vacancies", "jobs", "catalog", "positions", "countries_overview", "vacancy_detail"
+  ]);
+
+  // ── Catalog (короткий тизер) ──
+  if (SERVICES_ALLOW.has(category)) {
+    try {
+      const fromCatalog = await findCatalogAnswer(userTextRaw, userLang);
+      if (fromCatalog && typeof fromCatalog === "string" && fromCatalog.trim()) {
+        let outText = fromCatalog;
+        const detected = await detectLanguage(outText);
+        if (detected !== userLang) {
+          outText = (await translateCached(outText, detected, userLang)).text;
+        }
+        const { canonical } = await toEnglishCanonical(outText);
+        await logReply(sessionId, "services_hint", "catalog", null, userMsgId, null);
+        await saveMessage(
+          sessionId, "assistant", canonical,
+          { category: "catalog", strategy: "services_hint" },
+          "en", userLang, outText, "catalog"
+        );
+        return outText;
+      }
+    } catch (e) {
+      await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
+      // не падаем, идём дальше
+    }
+  }
+
+  // KB → перевод → LLM fallback
   let kb = await kbFind(category, userLang);
   let answer, strategy = "fallback_llm", kbItemId = null;
 
