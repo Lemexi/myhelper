@@ -9,13 +9,16 @@ import {
   translateCached, translateWithStyle,
   toEnglishCanonical, detectLanguage
 } from "./translator.js";
+
+// ВАЖНО: без комментариев внутри фигурных скобок!
 import {
-  classifyCategory, /* старый detectAnyName НЕ используем здесь */,
+  classifyCategory,
   detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
   isCmdAnswerExpensive, extractGreeting
 } from "./classifier.js";
+
 import { runLLM } from "./llm.js";
 
 import {
@@ -24,10 +27,10 @@ import {
   getCatalogSnapshot
 } from "./services.js";
 
-// 🆕 Оркестратор разговоров (шаги/имя/роль/узкие ответы)
+// Оркестратор разговоров (шаги/имя/роль/узкие ответы)
 import {
   detectNameSmart,              // (text, knownName?) -> {name, confidence, correctedFrom?, ackNeeded?}
-  detectRole,                   // (text) -> "candidate" | "agent" | null
+  detectRole,                   // (text) -> "candidate" | "agent" | null (используется внутри decideNextStep)
   decideNextStep                // ({session, text, snapshot}) -> { questionEN|null, metaPatch|null, blockCatalog?:boolean }
 } from "./orchestrator.js";
 
@@ -338,14 +341,12 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   // Текущий профиль сессии (для оркестратора)
   const session = await getSession(sessionId);
 
-  // 📛 Улучшенная детекция имени (мультиязычная) + исправления
+  // Улучшенная детекция имени (мультиязычная) + исправления
   const nameInfo = await detectNameSmart(userTextRaw, session?.user_name?.trim() || null);
   if (nameInfo?.name) {
-    // Если имя изменилось/уточнилось — обновим контакт
     if (nameInfo.name !== session?.user_name) {
       await updateContact(sessionId, { name: nameInfo.name });
     }
-    // Если пользователь явно исправил нас — коротко подтвердим и не идём дальше этим ходом
     if (nameInfo.ackNeeded) {
       const ackEN = `Got it — I’ll address you as ${nameInfo.name}.`;
       const { finalText } = await localizeForUser({ sessionId, userLang, textEN: ackEN, prependNoticeIfNeeded: true });
@@ -378,7 +379,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return finalText;
   }
 
-  // 🧭 Оркестратор: решить следующий шаг (без кнопок, только текст)
+  // Оркестратор: решить следующий шаг (без кнопок, только текст)
   let metaPatch = null;
   try {
     const step = await decideNextStep({ session, text: userTextRaw, snapshot: getCatalogSnapshot() });
@@ -394,14 +395,12 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
         { category: "orchestrator", strategy: "next_question", ...(metaPatch || {}), ...(metaExtra || {}) },
         "en", userLang, finalText, "orchestrator"
       );
-      return finalText; // задаём один вопрос и ждём ответ
+      return finalText;
     }
 
-    // Если оркестратор говорит «каталог пока не показывать» — пропускаем попытку каталога
+    // Если оркестратор говорит «каталог пока не показывать»
     if (step?.blockCatalog) {
-      // Мягкий LLM-ответ (короткий), затем вернёмся к шагам на следующем ходу
       let briefEN = await replyCore(sessionId, userTextEN);
-      // уменьшаем длину при необходимости
       if (briefEN && briefEN.length > 900) briefEN = briefEN.slice(0, 850) + "…";
       const { finalText } = await localizeForUser({ sessionId, userLang, textEN: briefEN, prependNoticeIfNeeded: true });
       const { canonical } = await toEnglishCanonical(finalText);
@@ -414,7 +413,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     // мягкий фолбэк — игнорируем сбои оркестратора
   }
 
-  // 1) Пытаемся ответить из каталога (короткие ответы на конкретные вопросы, локализуем)
+  // 1) Пытаемся ответить из каталога
   try {
     const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
     if (catAns) return catAns;
@@ -445,7 +444,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     if (detectedLLM && detectedLLM !== "en") {
       answerEN = (await translateCached(answerEN, detectedLLM, "en")).text;
     }
-    // Ограничим длину, чтобы не присылать «простыню»
     if (answerEN && answerEN.length > 1200) answerEN = answerEN.slice(0, 1150) + "…";
   }
 
