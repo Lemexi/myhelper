@@ -17,17 +17,38 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-// Catalog helpers
-// services.js exports:
-// - findCatalogAnswer(rawText, userLang?) -> { answer, meta? } | null
-// - enrichExpensiveAnswer(baseText, userLang?) -> string
-// - getCatalogSnapshot() -> { sig, openCountries: string[] }
-import { findCatalogAnswer, enrichExpensiveAnswer, getCatalogSnapshot } from "./services.js";
+import {
+  findCatalogAnswer,
+  enrichExpensiveAnswer,
+  getCatalogSnapshot
+} from "./services.js";
 
-/* ───────────────── Internals ───────────────── */
+/* ───────────────── Settings ───────────────── */
+
+// Языки без предупреждения про переводчик:
+const WHITELIST_LOCALES = new Set(["en", "ru", "pl", "cs", "cz"]);
+
+// Нормализация кода языка (cs/cz -> cs)
+function normLangCode(code) {
+  const c = String(code || "").toLowerCase();
+  if (c === "cz") return "cs";
+  return c;
+}
+
+function langDisplayName(code) {
+  const c = normLangCode(code);
+  const map = {
+    en: "English",
+    ru: "Russian",
+    pl: "Polish",
+    cs: "Czech"
+  };
+  return map[c] || c.toUpperCase();
+}
+
+/* ───────────────── Core helpers ───────────────── */
 
 async function replyCore(sessionId, userTextEN) {
-  // Use only safe recent messages for LLM context
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -51,25 +72,81 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-function buildAskName(rawText) {
+function buildAskName(rawText, outLang) {
   const hi = extractGreeting(rawText);
-  // user-facing text in EN by default
-  return `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`;
+  const by = {
+    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`,
+    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
+    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
+    cs: `${hi ? hi + ". " : ""}Mohu poprosit o vaše jméno, abych věděl, jak vás oslovovat?`
+  };
+  return by[normLangCode(outLang)] || by.en;
 }
 
-/* ───────────────── Commands ───────────────── */
+/* ───────────────── Language behavior ───────────────── */
 
-async function handleCmdTranslate(sessionId, rawText, userLangHint = "en") {
+// Однократное предупреждение про «используем переводчик»
+async function getWarnedLangs(sessionId) {
+  const recentRaw = await loadRecentMessages(sessionId, 50);
+  const warned = new Set();
+  if (!Array.isArray(recentRaw)) return warned;
+  for (const m of recentRaw) {
+    if (m?.role !== "assistant") continue;
+    const meta = m?.meta_json || m?.meta || null;
+    if (meta && Array.isArray(meta.translator_notice_for)) {
+      for (const x of meta.translator_notice_for) warned.add(normLangCode(x));
+    }
+  }
+  return warned;
+}
+
+function detectLangProbeQuestion(userTextRaw) {
+  const t = String(userTextRaw || "").toLowerCase();
+  return (
+    /what\s+languages\s+(do\s+you\s+)?(speak|know)/i.test(t) ||
+    /какие\s+языки\s+ты\s+(зна(е|ё)шь|знаешь)/i.test(t) ||
+    /на\s+каких\s+языках\s+(ты\s+)?(говоришь|общаешься)/i.test(t) ||
+    /jakimi\s+językami\s+(mówisz|operujesz)/i.test(t) ||
+    /jakými\s+jazyky\s+(mluvíš|ovládáš)/i.test(t)
+  );
+}
+
+async function localizeForUser({ sessionId, userLang, textEN, prependNoticeIfNeeded = true }) {
+  const outLang = normLangCode(userLang || "en");
+  // Если язык в белом списке — просто переводим/оставляем EN.
+  if (WHITELIST_LOCALES.has(outLang)) {
+    if (outLang === "en") return { finalText: textEN, metaExtra: {} };
+    const localized = (await translateCached(textEN, "en", outLang)).text;
+    return { finalText: localized, metaExtra: {} };
+  }
+
+  // Язык вне белого списка — проверяем, предупреждали ли ранее
+  const warned = await getWarnedLangs(sessionId);
+  const alreadyWarned = warned.has(outLang);
+  const localized = (await translateCached(textEN, "en", outLang)).text;
+
+  if (!prependNoticeIfNeeded || alreadyWarned) {
+    return { finalText: localized, metaExtra: {} };
+  }
+
+  const noticeEN = `Heads up: we don’t speak ${langDisplayName(outLang)} natively, so for quality we’ll use a translator. We can continue in your language.`;
+  const finalText = `${noticeEN}\n\n${localized}`;
+  return { finalText, metaExtra: { translator_notice_for: [outLang] } };
+}
+
+/* ───────────────── Admin commands (RU only) ───────────────── */
+
+async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord ? targetLangWord : "en").toLowerCase();
 
   if (!text || text.length < 2) {
-    const msg = "Text is required after the 'Translate' command.";
+    const msg = "Нужен текст после команды «Переведи».";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "translate", strategy: "cmd_translate_error" },
-      "en", userLangHint, msg, "translate"
+      "en", userLang, msg, "translate"
     );
     return msg;
   }
@@ -82,96 +159,96 @@ async function handleCmdTranslate(sessionId, rawText, userLangHint = "en") {
     });
 
   const combined =
-`🔍 Translation (${tgt.toUpperCase()}):
+`🔍 Перевод (${tgt.toUpperCase()}):
 ${styled}
 
-💬 RU helper:
+💬 Для тебя (RU):
 ${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: "translate", strategy: "cmd_translate" },
-    "en", userLangHint, combined, "translate"
+    "en", userLang, combined, "translate"
   );
 
   return combined;
 }
 
-async function handleCmdTeach(sessionId, rawText, userLangHint = "en") {
+async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
-    const msg = "Text is required after 'Would answer…'.";
+    const msg = "Нужен текст после «Ответил бы».";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "teach", strategy: "cmd_teach_error" },
-      "en", userLangHint, msg, "teach"
+      "en", userLang, msg, "teach"
     );
     return msg;
   }
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
-  const kbId = await kbInsertAnswer(lastCat, userLangHint || "en", taught, true);
+  const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
 
-  const out = `✅ Added to knowledge base.\n\n${taught}`;
+  const out = `✅ В базу добавлено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: lastCat, strategy: "cmd_teach", kb_id: kbId },
-    "en", userLangHint, out, lastCat
+    "en", userLang, out, lastCat
   );
   return out;
 }
 
-async function handleCmdAnswerExpensive(sessionId, userLangHint = "en") {
-  const kb = (await kbFind("expensive", userLangHint)) || (await kbFind("expensive", "en"));
+async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
+  const kb = (await kbFind("expensive", userLang)) || (await kbFind("expensive", "ru"));
   let answer;
   if (kb?.answer) {
-    answer = userLangHint !== "en"
-      ? (await translateCached(kb.answer, "en", userLangHint)).text
+    answer = userLang !== "ru"
+      ? (await translateCached(kb.answer, "ru", userLang)).text
       : kb.answer;
   } else {
     answer = await replyCore(
       sessionId,
-      "Client says it's expensive. Give a brief WhatsApp-style response with value framing and a clear CTA."
+      "Клиент говорит, что это дорого. Дай короткий ответ в стиле WhatsApp на русском с акцентом на ценность и чётким CTA."
     );
   }
 
-  // Add factual ranges/prices from catalog if available
+  // Обогатим фактами каталога (services вернет EN → переведем в RU)
   try {
-    answer = await enrichExpensiveAnswer(answer, userLangHint);
+    const enrichedEN = await enrichExpensiveAnswer(answer, "en");
+    const detected = await detectLanguage(enrichedEN);
+    if (detected !== "ru") {
+      answer = (await translateCached(enrichedEN, detected || "en", "ru")).text;
+    } else {
+      answer = enrichedEN;
+    }
   } catch (_) { /* soft fallback */ }
 
   const { canonical } = await toEnglishCanonical(answer);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: "expensive", strategy: "cmd_answer_expensive" },
-    "en", userLangHint, answer, "expensive"
+    "en", userLang, answer, "expensive"
   );
   await logReply(sessionId, "cmd", "expensive", kb?.id || null, null, "trigger: answer expensive");
   return answer;
 }
 
-/* ───────────────── Catalog helpers ───────────────── */
+/* ───────────────── Catalog (user answers generated EN → localized) ───────────────── */
 
-// Try to find the last saved catalog snapshot (from previous assistant replies)
 async function loadLastCatalogSnapshotMeta(sessionId) {
-  const recentRaw = await loadRecentMessages(sessionId, 40); // raw with meta fields
+  const recentRaw = await loadRecentMessages(sessionId, 40);
   if (!Array.isArray(recentRaw)) return null;
-
-  // Look backwards for assistant message with meta.snapshot
   for (let i = recentRaw.length - 1; i >= 0; i--) {
     const m = recentRaw[i];
     if (m?.role !== "assistant") continue;
     const meta = (m?.meta_json) || m?.meta || null;
-    if (meta && meta.snapshot && meta.snapshot.sig) {
-      return meta.snapshot; // { sig, openCountries }
-    }
+    if (meta && meta.snapshot && meta.snapshot.sig) return meta.snapshot;
   }
   return null;
 }
 
-// Compare old vs current and create a short change notice in EN
 function buildChangeNotice(prevSnap, currentSnap, focusCountry) {
   if (!prevSnap || !currentSnap || prevSnap.sig === currentSnap.sig) return null;
 
@@ -195,34 +272,33 @@ function buildChangeNotice(prevSnap, currentSnap, focusCountry) {
 }
 
 async function tryCatalogAnswer(sessionId, rawText, userLang) {
-  // Check changes vs last snapshot for transparency
   const prevSnap = await loadLastCatalogSnapshotMeta(sessionId);
   const currentSnap = getCatalogSnapshot();
 
-  const hit = await findCatalogAnswer(rawText, userLang);
+  const hit = await findCatalogAnswer(rawText, "en");
   if (!hit || !hit.answer) return null;
 
   const { answer, meta } = hit;
-
-  // If meta knows the country, use it for targeted notice
   const focusCountry = meta?.country || null;
-  const notice = buildChangeNotice(prevSnap, currentSnap, focusCountry);
+  const noticeEN = buildChangeNotice(prevSnap, currentSnap, focusCountry);
+  const stitchedEN = noticeEN ? `${noticeEN}\n\n${answer}` : answer;
 
-  const finalAnswer = notice ? `${notice}\n\n${answer}` : answer;
+  // Локализуем по правилам (возможное одноразовое предупреждение)
+  const { finalText, metaExtra } = await localizeForUser({
+    sessionId, userLang, textEN: stitchedEN, prependNoticeIfNeeded: true
+  });
 
-  const { canonical } = await toEnglishCanonical(finalAnswer);
-
-  // Persist with meta including current snapshot for future diffs
-  const metaToSave = Object.assign({}, meta || {}, { snapshot: currentSnap });
+  const { canonical } = await toEnglishCanonical(finalText);
+  const metaToSave = Object.assign({}, meta || {}, { snapshot: currentSnap }, metaExtra || null);
 
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: "catalog", strategy: "catalog_hit", ...metaToSave },
-    "en", userLang, finalAnswer, "catalog"
+    "en", userLang, finalText, "catalog"
   );
   await logReply(sessionId, "catalog", "catalog", null, null, meta ? JSON.stringify(meta) : null);
 
-  return finalAnswer;
+  return finalText;
 }
 
 /* ───────────────── SmartReply ───────────────── */
@@ -230,19 +306,34 @@ async function tryCatalogAnswer(sessionId, rawText, userLang) {
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "en") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Normalize input
+  // Канонизируем вход, получаем исходный язык пользователя
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
-  const userLang = srcLang || userLangHint || "en";
+  const userLang = normLangCode(srcLang || userLangHint || "en");
 
-  // Commands
+  // Если пользователь спрашивает "какие языки знаешь" — отвечаем минимально, без списка
+  if (detectLangProbeQuestion(userTextRaw)) {
+    const msgEN = `I’m communicating with you in ${langDisplayName(userLang)}. Is this okay for you?`;
+    const { finalText } = await localizeForUser({
+      sessionId, userLang, textEN: msgEN, prependNoticeIfNeeded: true
+    });
+    const { canonical } = await toEnglishCanonical(finalText);
+    await saveMessage(
+      sessionId, "assistant", canonical,
+      { category: "smalltalk", strategy: "lang_probe" },
+      "en", userLang, finalText, "smalltalk"
+    );
+    return finalText;
+  }
+
+  // АДМИН-КОМАНДЫ (всегда RU)
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "teach" },
       "en", userLang, origText, null
     );
-    const out = await handleCmdTeach(sessionId, userTextRaw, userLang);
+    const out = await handleCmdTeach(sessionId, userTextRaw, "ru");
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
   }
@@ -255,11 +346,11 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
         { kind: "cmd_detected", cmd: "translate" },
         "en", userLang, origText, null
       );
-      const out = await handleCmdTranslate(sessionId, userTextRaw, userLang);
+      const out = await handleCmdTranslate(sessionId, userTextRaw, "ru");
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     } else {
-      const msg = "Text is required after the 'Translate' command.";
+      const msg = "Нужен текст после команды «Переведи».";
       const { canonical } = await toEnglishCanonical(msg);
       await saveMessage(
         sessionId, "assistant", canonical,
@@ -276,78 +367,85 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       { kind: "cmd_detected", cmd: "answer_expensive" },
       "en", userLang, origText, null
     );
-    const out = await handleCmdAnswerExpensive(sessionId, userLang);
+    const out = await handleCmdAnswerExpensive(sessionId, "ru");
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
     return out;
   }
 
-  // Name / phone updates
+  // Имя / телефон в контакт
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // Persist user message
+  // Сохраняем вход пользователя
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
     null, "en", userLang, origText, null
   );
 
-  // Ask for name if unknown
+  // Если имени нет — спросим (локализуем)
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
-    const ask = buildAskName(userTextRaw);
-    const { canonical } = await toEnglishCanonical(ask);
+    const askEN = buildAskName(userTextRaw, "en"); // шаблонный EN
+    const { finalText } = await localizeForUser({
+      sessionId, userLang, textEN: askEN, prependNoticeIfNeeded: true
+    });
+    const { canonical } = await toEnglishCanonical(finalText);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "ask_name", strategy: "precheck_name" },
-      "en", userLang, ask, "ask_name"
+      "en", userLang, finalText, "ask_name"
     );
-    return ask;
+    return finalText;
   }
 
-  // Try answering from the services catalog first
+  // 1) Пытаемся ответить из каталога (EN → локализация)
   try {
     const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
     if (catAns) return catAns;
-  } catch (_) {
-    // soft fallback
-  }
+  } catch (_) { /* soft fallback */ }
 
-  // KB → LLM fallback
+  // 2) KB → LLM
   const category = await classifyCategory(userTextRaw);
 
-  let kb = await kbFind(category, userLang);
-  let answer, strategy = "fallback_llm", kbItemId = null;
+  let kb = await kbFind(category, "en");
+  let answerEN, strategy = "fallback_llm", kbItemId = null;
 
   if (kb) {
-    answer = kb.answer;
+    answerEN = kb.answer;
     strategy = "kb_hit";
     kbItemId = kb.id;
   } else {
-    const kbEN = await kbFind(category, "en");
-    if (kbEN) {
-      answer = (await translateCached(kbEN.answer, "en", userLang)).text;
+    // позволяем RU KB, если нет EN
+    const kbRu = await kbFind(category, "ru");
+    if (kbRu) {
+      answerEN = (await translateCached(kbRu.answer, "ru", "en")).text;
       strategy = "kb_translated";
-      kbItemId = kbEN.id;
+      kbItemId = kbRu.id;
     }
   }
 
-  if (!answer) {
-    answer = await replyCore(sessionId, userTextEN);
-    const detectedLLM = await detectLanguage(answer);
-    if (detectedLLM && detectedLLM !== userLang) {
-      answer = (await translateCached(answer, detectedLLM, userLang)).text;
+  if (!answerEN) {
+    // генерим EN → потом локализуем
+    answerEN = await replyCore(sessionId, userTextEN);
+    const detectedLLM = await detectLanguage(answerEN);
+    if (detectedLLM && detectedLLM !== "en") {
+      answerEN = (await translateCached(answerEN, detectedLLM, "en")).text;
     }
   }
 
-  const { canonical: ansEN } = await toEnglishCanonical(answer);
+  const { finalText } = await localizeForUser({
+    sessionId, userLang, textEN: answerEN, prependNoticeIfNeeded: true
+  });
+
+  const { canonical: ansEN } = await toEnglishCanonical(finalText);
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
   await saveMessage(
     sessionId, "assistant", ansEN,
     { category, strategy },
-    "en", userLang, answer, category
+    "en", userLang, finalText, category
   );
 
-  return answer;
+  return finalText;
 }
