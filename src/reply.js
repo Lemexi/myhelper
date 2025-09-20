@@ -10,7 +10,8 @@ import {
   toEnglishCanonical, detectLanguage
 } from "./translator.js";
 import {
-  classifyCategory, detectAnyName, detectPhone,
+  classifyCategory, /* старый detectAnyName НЕ используем здесь */,
+  detectPhone,
   isCmdTeach, parseCmdTeach,
   isCmdTranslate, parseCmdTranslate,
   isCmdAnswerExpensive, extractGreeting
@@ -22,6 +23,13 @@ import {
   enrichExpensiveAnswer,
   getCatalogSnapshot
 } from "./services.js";
+
+// 🆕 Оркестратор разговоров (шаги/имя/роль/узкие ответы)
+import {
+  detectNameSmart,              // (text, knownName?) -> {name, confidence, correctedFrom?, ackNeeded?}
+  detectRole,                   // (text) -> "candidate" | "agent" | null
+  decideNextStep                // ({session, text, snapshot}) -> { questionEN|null, metaPatch|null, blockCatalog?:boolean }
+} from "./orchestrator.js";
 
 /* ───────────────── Settings ───────────────── */
 
@@ -37,12 +45,7 @@ function normLangCode(code) {
 
 function langDisplayName(code) {
   const c = normLangCode(code);
-  const map = {
-    en: "English",
-    ru: "Russian",
-    pl: "Polish",
-    cs: "Czech"
-  };
+  const map = { en: "English", ru: "Russian", pl: "Polish", cs: "Czech" };
   return map[c] || c.toUpperCase();
 }
 
@@ -59,10 +62,7 @@ async function replyCore(sessionId, userTextEN) {
   const messages = [];
   messages.push({ role: "system", content: SYSTEM_PROMPT });
   if (summary) {
-    messages.push({
-      role: "system",
-      content: `Brief recap of prior conversation:\n${summary}`
-    });
+    messages.push({ role: "system", content: `Brief recap of prior conversation:\n${summary}` });
   }
   messages.push(...recent);
   messages.push({ role: "user", content: userTextEN });
@@ -113,14 +113,11 @@ function detectLangProbeQuestion(userTextRaw) {
 
 async function localizeForUser({ sessionId, userLang, textEN, prependNoticeIfNeeded = true }) {
   const outLang = normLangCode(userLang || "en");
-  // Если язык в белом списке — просто переводим/оставляем EN.
   if (WHITELIST_LOCALES.has(outLang)) {
     if (outLang === "en") return { finalText: textEN, metaExtra: {} };
     const localized = (await translateCached(textEN, "en", outLang)).text;
     return { finalText: localized, metaExtra: {} };
   }
-
-  // Язык вне белого списка — проверяем, предупреждали ли ранее
   const warned = await getWarnedLangs(sessionId);
   const alreadyWarned = warned.has(outLang);
   const localized = (await translateCached(textEN, "en", outLang)).text;
@@ -143,20 +140,14 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   if (!text || text.length < 2) {
     const msg = "Нужен текст после команды «Переведи».";
     const { canonical } = await toEnglishCanonical(msg);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "translate", strategy: "cmd_translate_error" },
-      "en", userLang, msg, "translate"
-    );
+      "en", userLang, msg, "translate");
     return msg;
   }
 
   const { targetLang: tgt, styled, styledRu } =
-    await translateWithStyle({
-      sourceText: text,
-      targetLang,
-      style: "influence_psychology_marketing_neurocopy"
-    });
+    await translateWithStyle({ sourceText: text, targetLang, style: "influence_psychology_marketing_neurocopy" });
 
   const combined =
 `🔍 Перевод (${tgt.toUpperCase()}):
@@ -166,12 +157,9 @@ ${styled}
 ${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: "translate", strategy: "cmd_translate" },
-    "en", userLang, combined, "translate"
-  );
-
+    "en", userLang, combined, "translate");
   return combined;
 }
 
@@ -180,11 +168,9 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
   if (!taught) {
     const msg = "Нужен текст после «Ответил бы».";
     const { canonical } = await toEnglishCanonical(msg);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "teach", strategy: "cmd_teach_error" },
-      "en", userLang, msg, "teach"
-    );
+      "en", userLang, msg, "teach");
     return msg;
   }
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
@@ -192,11 +178,9 @@ async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
 
   const out = `✅ В базу добавлено.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: lastCat, strategy: "cmd_teach", kb_id: kbId },
-    "en", userLang, out, lastCat
-  );
+    "en", userLang, out, lastCat);
   return out;
 }
 
@@ -204,9 +188,7 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   const kb = (await kbFind("expensive", userLang)) || (await kbFind("expensive", "ru"));
   let answer;
   if (kb?.answer) {
-    answer = userLang !== "ru"
-      ? (await translateCached(kb.answer, "ru", userLang)).text
-      : kb.answer;
+    answer = userLang !== "ru" ? (await translateCached(kb.answer, "ru", userLang)).text : kb.answer;
   } else {
     answer = await replyCore(
       sessionId,
@@ -214,7 +196,6 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     );
   }
 
-  // Обогатим фактами каталога (services вернет EN → переведем в RU)
   try {
     const enrichedEN = await enrichExpensiveAnswer(answer, "en");
     const detected = await detectLanguage(enrichedEN);
@@ -226,16 +207,14 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   } catch (_) { /* soft fallback */ }
 
   const { canonical } = await toEnglishCanonical(answer);
-  await saveMessage(
-    sessionId, "assistant", canonical,
+  await saveMessage(sessionId, "assistant", canonical,
     { category: "expensive", strategy: "cmd_answer_expensive" },
-    "en", userLang, answer, "expensive"
-  );
+    "en", userLang, answer, "expensive");
   await logReply(sessionId, "cmd", "expensive", kb?.id || null, null, "trigger: answer expensive");
   return answer;
 }
 
-/* ───────────────── Catalog (user answers generated EN → localized) ───────────────── */
+/* ───────────────── Catalog helpers ───────────────── */
 
 async function loadLastCatalogSnapshotMeta(sessionId) {
   const recentRaw = await loadRecentMessages(sessionId, 40);
@@ -283,7 +262,6 @@ async function tryCatalogAnswer(sessionId, rawText, userLang) {
   const noticeEN = buildChangeNotice(prevSnap, currentSnap, focusCountry);
   const stitchedEN = noticeEN ? `${noticeEN}\n\n${answer}` : answer;
 
-  // Локализуем по правилам (возможное одноразовое предупреждение)
   const { finalText, metaExtra } = await localizeForUser({
     sessionId, userLang, textEN: stitchedEN, prependNoticeIfNeeded: true
   });
@@ -311,28 +289,21 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     await toEnglishCanonical(userTextRaw);
   const userLang = normLangCode(srcLang || userLangHint || "en");
 
-  // Если пользователь спрашивает "какие языки знаешь" — отвечаем минимально, без списка
+  // Языковая «проверка»
   if (detectLangProbeQuestion(userTextRaw)) {
     const msgEN = `I’m communicating with you in ${langDisplayName(userLang)}. Is this okay for you?`;
-    const { finalText } = await localizeForUser({
-      sessionId, userLang, textEN: msgEN, prependNoticeIfNeeded: true
-    });
+    const { finalText } = await localizeForUser({ sessionId, userLang, textEN: msgEN, prependNoticeIfNeeded: true });
     const { canonical } = await toEnglishCanonical(finalText);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "smalltalk", strategy: "lang_probe" },
-      "en", userLang, finalText, "smalltalk"
-    );
+      "en", userLang, finalText, "smalltalk");
     return finalText;
   }
 
   // АДМИН-КОМАНДЫ (всегда RU)
   if (isCmdTeach(userTextRaw)) {
-    const msgId = await saveMessage(
-      sessionId, "user", userTextEN,
-      { kind: "cmd_detected", cmd: "teach" },
-      "en", userLang, origText, null
-    );
+    const msgId = await saveMessage(sessionId, "user", userTextEN,
+      { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
     const out = await handleCmdTeach(sessionId, userTextRaw, "ru");
     await logReply(sessionId, "cmd", "teach", null, msgId, "trigger: teach");
     return out;
@@ -341,72 +312,115 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   if (isCmdTranslate(userTextRaw)) {
     const { text: t } = parseCmdTranslate(userTextRaw);
     if (t && t.length >= 2) {
-      const msgId = await saveMessage(
-        sessionId, "user", userTextEN,
-        { kind: "cmd_detected", cmd: "translate" },
-        "en", userLang, origText, null
-      );
+      const msgId = await saveMessage(sessionId, "user", userTextEN,
+        { kind: "cmd_detected", cmd: "translate" }, "en", userLang, origText, null);
       const out = await handleCmdTranslate(sessionId, userTextRaw, "ru");
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     } else {
       const msg = "Нужен текст после команды «Переведи».";
       const { canonical } = await toEnglishCanonical(msg);
-      await saveMessage(
-        sessionId, "assistant", canonical,
+      await saveMessage(sessionId, "assistant", canonical,
         { category: "translate", strategy: "cmd_translate_error" },
-        "en", userLang, msg, "translate"
-      );
+        "en", userLang, msg, "translate");
       return msg;
     }
   }
 
   if (isCmdAnswerExpensive(userTextRaw)) {
-    const msgId = await saveMessage(
-      sessionId, "user", userTextEN,
-      { kind: "cmd_detected", cmd: "answer_expensive" },
-      "en", userLang, origText, null
-    );
+    const msgId = await saveMessage(sessionId, "user", userTextEN,
+      { kind: "cmd_detected", cmd: "answer_expensive" }, "en", userLang, origText, null);
     const out = await handleCmdAnswerExpensive(sessionId, "ru");
     await logReply(sessionId, "cmd", "expensive", null, msgId, "trigger: answer expensive");
     return out;
   }
 
-  // Имя / телефон в контакт
-  const nameInThisMsg = detectAnyName(userTextRaw);
+  // Текущий профиль сессии (для оркестратора)
+  const session = await getSession(sessionId);
+
+  // 📛 Улучшенная детекция имени (мультиязычная) + исправления
+  const nameInfo = await detectNameSmart(userTextRaw, session?.user_name?.trim() || null);
+  if (nameInfo?.name) {
+    // Если имя изменилось/уточнилось — обновим контакт
+    if (nameInfo.name !== session?.user_name) {
+      await updateContact(sessionId, { name: nameInfo.name });
+    }
+    // Если пользователь явно исправил нас — коротко подтвердим и не идём дальше этим ходом
+    if (nameInfo.ackNeeded) {
+      const ackEN = `Got it — I’ll address you as ${nameInfo.name}.`;
+      const { finalText } = await localizeForUser({ sessionId, userLang, textEN: ackEN, prependNoticeIfNeeded: true });
+      const { canonical } = await toEnglishCanonical(finalText);
+      await saveMessage(sessionId, "assistant", canonical,
+        { category: "profile", strategy: "name_ack", meta: { name_confidence: nameInfo.confidence } },
+        "en", userLang, finalText, "profile");
+      return finalText;
+    }
+  }
+
+  // Телефон (как раньше)
   const phone = detectPhone(userTextRaw);
-  if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
+  if (phone) await updateContact(sessionId, { phone });
 
   // Сохраняем вход пользователя
   const userMsgId = await saveMessage(
-    sessionId, "user", userTextEN,
-    null, "en", userLang, origText, null
+    sessionId, "user", userTextEN, null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим (локализуем)
-  const session = await getSession(sessionId);
-  const knownName = nameInThisMsg || session?.user_name?.trim();
+  // Если имени нет вообще — спросим (локализуем)
+  const knownName = (nameInfo?.name) || session?.user_name?.trim();
   if (!knownName) {
-    const askEN = buildAskName(userTextRaw, "en"); // шаблонный EN
-    const { finalText } = await localizeForUser({
-      sessionId, userLang, textEN: askEN, prependNoticeIfNeeded: true
-    });
+    const askEN = buildAskName(userTextRaw, "en");
+    const { finalText } = await localizeForUser({ sessionId, userLang, textEN: askEN, prependNoticeIfNeeded: true });
     const { canonical } = await toEnglishCanonical(finalText);
-    await saveMessage(
-      sessionId, "assistant", canonical,
+    await saveMessage(sessionId, "assistant", canonical,
       { category: "ask_name", strategy: "precheck_name" },
-      "en", userLang, finalText, "ask_name"
-    );
+      "en", userLang, finalText, "ask_name");
     return finalText;
   }
 
-  // 1) Пытаемся ответить из каталога (EN → локализация)
+  // 🧭 Оркестратор: решить следующий шаг (без кнопок, только текст)
+  let metaPatch = null;
+  try {
+    const step = await decideNextStep({ session, text: userTextRaw, snapshot: getCatalogSnapshot() });
+    if (step?.metaPatch) metaPatch = step.metaPatch;
+
+    if (step?.questionEN) {
+      const { finalText, metaExtra } = await localizeForUser({
+        sessionId, userLang, textEN: step.questionEN, prependNoticeIfNeeded: true
+      });
+      const { canonical } = await toEnglishCanonical(finalText);
+      await saveMessage(
+        sessionId, "assistant", canonical,
+        { category: "orchestrator", strategy: "next_question", ...(metaPatch || {}), ...(metaExtra || {}) },
+        "en", userLang, finalText, "orchestrator"
+      );
+      return finalText; // задаём один вопрос и ждём ответ
+    }
+
+    // Если оркестратор говорит «каталог пока не показывать» — пропускаем попытку каталога
+    if (step?.blockCatalog) {
+      // Мягкий LLM-ответ (короткий), затем вернёмся к шагам на следующем ходу
+      let briefEN = await replyCore(sessionId, userTextEN);
+      // уменьшаем длину при необходимости
+      if (briefEN && briefEN.length > 900) briefEN = briefEN.slice(0, 850) + "…";
+      const { finalText } = await localizeForUser({ sessionId, userLang, textEN: briefEN, prependNoticeIfNeeded: true });
+      const { canonical } = await toEnglishCanonical(finalText);
+      await saveMessage(sessionId, "assistant", canonical,
+        { category: "smalltalk", strategy: "brief_fallback", ...(metaPatch || {}) },
+        "en", userLang, finalText, "smalltalk");
+      return finalText;
+    }
+  } catch (_) {
+    // мягкий фолбэк — игнорируем сбои оркестратора
+  }
+
+  // 1) Пытаемся ответить из каталога (короткие ответы на конкретные вопросы, локализуем)
   try {
     const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
     if (catAns) return catAns;
   } catch (_) { /* soft fallback */ }
 
-  // 2) KB → LLM
+  // 2) KB → LLM (EN ядро → локализация)
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, "en");
@@ -417,7 +431,6 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     strategy = "kb_hit";
     kbItemId = kb.id;
   } else {
-    // позволяем RU KB, если нет EN
     const kbRu = await kbFind(category, "ru");
     if (kbRu) {
       answerEN = (await translateCached(kbRu.answer, "ru", "en")).text;
@@ -427,12 +440,13 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   }
 
   if (!answerEN) {
-    // генерим EN → потом локализуем
     answerEN = await replyCore(sessionId, userTextEN);
     const detectedLLM = await detectLanguage(answerEN);
     if (detectedLLM && detectedLLM !== "en") {
       answerEN = (await translateCached(answerEN, detectedLLM, "en")).text;
     }
+    // Ограничим длину, чтобы не присылать «простыню»
+    if (answerEN && answerEN.length > 1200) answerEN = answerEN.slice(0, 1150) + "…";
   }
 
   const { finalText } = await localizeForUser({
@@ -443,7 +457,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
   await saveMessage(
     sessionId, "assistant", ansEN,
-    { category, strategy },
+    { category, strategy, ...(metaPatch || {}) },
     "en", userLang, finalText, category
   );
 
