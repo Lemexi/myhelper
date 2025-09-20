@@ -1,6 +1,6 @@
 // /src/services.js
-// Отдаём КОРОТКИЕ тизеры по вакансиям/странам/ценам ТОЛЬКО при явном интенте.
-// Полные блоки — только если пользователь просит "подробнее/детально/полные условия".
+// КОРОТКИЕ тизеры из catalog.json только при явном интенте.
+// Никогда не придумываем позиций, которых нет в каталоге.
 
 import fs from "fs";
 import path from "path";
@@ -90,13 +90,7 @@ function detectPosition(text) {
   return null;
 }
 
-function getAvailableCountries(catalog) {
-  const set = new Set();
-  for (const v of (catalog.vacancies || [])) if (v.active) set.add((v.country || "").toUpperCase());
-  return Array.from(set);
-}
-
-// ── Форматтеры ──
+// — краткое форматирование
 function formatSalaryShort(v) {
   if (v.salary_text) return v.salary_text;
   const s = v.salary_net || v.salary_gross;
@@ -106,73 +100,85 @@ function formatSalaryShort(v) {
   }
   return "salary TBC";
 }
-
 function pickTop(list, n = 2) { return list.slice(0, n); }
 
-// ── Сигналы интента для каталога ──
+// Сигналы интента каталога
 const VACANCY_WORDS = [
   "vacanc", "position", "role", "jobs", "available",
-  "ваканси", "позици", "работа", "что есть по", "какие есть", "что доступно", "список", "каталог"
+  "ваканси", "позици", "работа", "что есть по", "какие есть", "что доступно", "список", "каталог", "страны доступны"
 ];
 const DETAIL_WORDS = ["detail", "full", "terms", "подроб", "деталь", "полные", "чеклист"];
 function hasAny(text, arr){ const t=norm(text); return arr.some(w => t.includes(w)); }
 
-// ── ПУБЛИЧНО ──
+// ── Публичное API ──
 export async function findCatalogAnswer(rawText, _userLang = "en") {
   const catalog = loadCatalog();
   const text = norm(rawText);
-  const availableCountries = getAvailableCountries(catalog);
+  const availableCountries = getCatalogSnapshot().openCountries;
   const countryPages = catalog.country_pages || {};
 
   const country = detectCountry(text);
   const positionKey = detectPosition(text);
   const wantDetail = hasAny(text, DETAIL_WORDS);
 
-  // 1) Не лезем, если нет явных сигналов про вакансии/позиции/каталог
-  const hasVacancySignal = hasAny(text, VACANCY_WORDS) || !!country || !!positionKey;
-  if (!hasVacancySignal) return null;
+  // Без сигнала — не отвечаем каталогом
+  const vacancySignal = hasAny(text, VACANCY_WORDS) || !!country || !!positionKey;
+  if (!vacancySignal) return null;
 
-  // 2) Если страна указана, но закрыта — короткий ответ-навигатор
+  // Если пользователь спросил «какие страны доступны»
+  if (/какие\s+страны|what\s+countries|countries\s+available/i.test(text)) {
+    return availableCountries.length
+      ? `Открыты: ${availableCountries.join(", ")}. Назовите страну + позицию — пришлю условия и чек-лист.`
+      : "Набор временно закрыт. Могу поставить вас в приоритет и уведомить об открытии.";
+  }
+
+  // Страна указана, но закрыто
   if (country && !availableCountries.includes(country)) {
     const alt = availableCountries.length ? `Open now: ${availableCountries.join(", ")}.` : "Recruitment is temporarily closed.";
     const link = countryPages[country]?.demand ? `\nDocs page: ${countryPages[country].demand}` : "";
     return `The ${country} direction is closed right now. ${alt}${link}\nTell me which country you prefer — I’ll send options.`;
   }
 
-  // 3) Без страны → только тизер по открытым направлениям (без простынь)
+  // Без страны — общий короткий обзор
   if (!country) {
     if (!availableCountries.length) {
       return "Recruitment is temporarily closed. I can put you on priority and ping you on reopening.";
     }
     const perCountry = availableCountries.map(c => {
       const list = (catalog.vacancies || []).filter(v => v.active && (v.country || "").toUpperCase() === c);
-      const top = pickTop(list, 2)
-        .map(v => `${v.position} — ${formatSalaryShort(v)}`)
-        .join("; ");
+      const top = pickTop(list, 2).map(v => `${v.position} — ${formatSalaryShort(v)}`).join("; ");
       const link = countryPages[c]?.demand ? ` (docs: ${countryPages[c].demand})` : "";
       return `${c}: ${top}${link}`;
     });
     return `Open now — ${perCountry.join(" | ")}.\nSay the country + position, and I’ll send full terms or a checklist.`;
   }
 
-  // 4) Есть страна → краткие 1–2 варианта; полный блок только если просят «подробнее»
+  // Есть страна → подберём
   let matches = (catalog.vacancies || []).filter(v => v.active && (v.country || "").toUpperCase() === country);
   if (positionKey) {
-    matches = matches.filter(v => norm(v.position || "").includes(positionKey));
+    const key = positionKey;
+    matches = matches.filter(v => {
+      const p = norm(v.position || "");
+      if (!p) return false;
+      if (p.includes(key)) return true;
+      const syn = POSITION_SYNONYMS[key] || [];
+      return syn.some(s => p.includes(s));
+    });
   }
+
   if (!matches.length) {
     const link = countryPages[country]?.demand ? `\nDocs page: ${countryPages[country].demand}` : "";
-    return `In ${country} I can offer general warehouse/production roles${link ? "."+link : ""}\nTell me the exact role or company — I’ll send terms.`;
+    return `В ${country} сейчас открыты базовые склад/производство.${link ? " " + link : ""}\nСкажите точную роль или компанию — пришлю условия.`;
   }
 
   const top = pickTop(matches, 2);
   if (!wantDetail) {
     const line = top.map(v => `${v.company}: ${v.position} — ${formatSalaryShort(v)}`).join(" | ");
     const link = countryPages[country]?.demand ? ` (docs: ${countryPages[country].demand})` : "";
-    return `${country}: ${line}${link}\nWant full terms for one company? Say “details for <company>”.`;
+    return `${country}: ${line}${link}\nНужны полные условия по одной компании? Напишите: «детали по <название>».`;
   }
 
-  // 5) Полные условия — только по явному запросу
+  // Полные условия (по явному запросу)
   const blocks = top.map(v => {
     const bits = [
       v.company && `• Company: ${v.company}${v.city ? `, ${v.city}` : ""}`,
@@ -182,7 +188,6 @@ export async function findCatalogAnswer(rawText, _userLang = "en") {
     ].filter(Boolean).join("\n");
     return bits;
   }).join("\n\n");
-
   const link = countryPages[country]?.demand ? `\nDocs page: ${countryPages[country].demand}` : "";
-  return `${blocks}${link}\nIf this fits, I’ll send the checklist and pricing per candidate.`;
+  return `${blocks}${link}\nЕсли подходит — отправлю чек-лист и счёт за легальное сопровождение.`;
 }
