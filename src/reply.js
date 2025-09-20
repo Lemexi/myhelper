@@ -2,7 +2,8 @@
 import { SYSTEM_PROMPT } from "./prompt.js";
 import {
   upsertSession, updateContact, saveMessage, loadRecentMessages,
-  loadLatestSummary, logReply, getLastAuditCategory, getSession
+  loadLatestSummary, logReply, getLastAuditCategory, getSession,
+  patchSessionMeta
 } from "./db.js";
 import { kbFind, kbInsertAnswer } from "./kb.js";
 import {
@@ -27,19 +28,15 @@ import {
   getCatalogSnapshot
 } from "./services.js";
 
-// Оркестратор разговоров (шаги/имя/роль/узкие ответы)
 import {
-  detectNameSmart,              // (text, knownName?) -> {name, confidence, correctedFrom?, ackNeeded?}
-  detectRole,                   // (text) -> "candidate" | "agent" | null (используется внутри decideNextStep)
-  decideNextStep                // ({session, text, snapshot}) -> { questionEN|null, metaPatch|null, blockCatalog?:boolean }
+  detectNameSmart,
+  decideNextStep
 } from "./orchestrator.js";
 
 /* ───────────────── Settings ───────────────── */
 
-// Языки без предупреждения про переводчик:
 const WHITELIST_LOCALES = new Set(["en", "ru", "pl", "cs", "cz"]);
 
-// Нормализация кода языка (cs/cz -> cs)
 function normLangCode(code) {
   const c = String(code || "").toLowerCase();
   if (c === "cz") return "cs";
@@ -88,7 +85,6 @@ function buildAskName(rawText, outLang) {
 
 /* ───────────────── Language behavior ───────────────── */
 
-// Однократное предупреждение про «используем переводчик»
 async function getWarnedLangs(sessionId) {
   const recentRaw = await loadRecentMessages(sessionId, 50);
   const warned = new Set();
@@ -207,7 +203,7 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     } else {
       answer = enrichedEN;
     }
-  } catch (_) { /* soft fallback */ }
+  } catch (_) {}
 
   const { canonical } = await toEnglishCanonical(answer);
   await saveMessage(sessionId, "assistant", canonical,
@@ -282,17 +278,32 @@ async function tryCatalogAnswer(sessionId, rawText, userLang) {
   return finalText;
 }
 
+/* ───────────────── Context helper: did we just ask the name? ───────────────── */
+
+async function askedNameRecently(sessionId, lookbackMs = 6 * 60 * 1000) {
+  const recent = await loadRecentMessages(sessionId, 10);
+  const now = Date.now();
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const m = recent[i];
+    if (m.role !== "assistant") continue;
+    const meta = m.meta_json || m.meta || {};
+    if (meta?.category === "ask_name" || meta?.strategy === "precheck_name") {
+      const ts = m.created_at ? new Date(m.created_at).getTime() : now;
+      return (now - ts) <= lookbackMs;
+    }
+  }
+  return false;
+}
+
 /* ───────────────── SmartReply ───────────────── */
 
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "en") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канонизируем вход, получаем исходный язык пользователя
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
   const userLang = normLangCode(srcLang || userLangHint || "en");
 
-  // Языковая «проверка»
   if (detectLangProbeQuestion(userTextRaw)) {
     const msgEN = `I’m communicating with you in ${langDisplayName(userLang)}. Is this okay for you?`;
     const { finalText } = await localizeForUser({ sessionId, userLang, textEN: msgEN, prependNoticeIfNeeded: true });
@@ -303,7 +314,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return finalText;
   }
 
-  // АДМИН-КОМАНДЫ (всегда RU)
+  // Админ-команды (RU)
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(sessionId, "user", userTextEN,
       { kind: "cmd_detected", cmd: "teach" }, "en", userLang, origText, null);
@@ -338,10 +349,10 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // Текущий профиль сессии (для оркестратора)
+  // Текущая сессия
   const session = await getSession(sessionId);
 
-  // Улучшенная детекция имени (мультиязычная) + исправления
+  // Имя (умная детекция)
   const nameInfo = await detectNameSmart(userTextRaw, session?.user_name?.trim() || null);
   if (nameInfo?.name) {
     if (nameInfo.name !== session?.user_name) {
@@ -356,18 +367,33 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
         "en", userLang, finalText, "profile");
       return finalText;
     }
+  } else {
+    // Однословное имя сразу после вопроса об имени
+    const justAsked = await askedNameRecently(sessionId);
+    const oneWord = String(userTextRaw || "").trim();
+    const bareName = /^[A-ZА-ЯЁŁŚŻŹĆŃÓÉÜÄÖ][a-zа-яёłśżźćńóéüäö'-]{1,19}$/.test(oneWord);
+    if (justAsked && bareName) {
+      await updateContact(sessionId, { name: oneWord });
+      const ackEN = `Got it — I’ll address you as ${oneWord}.`;
+      const { finalText } = await localizeForUser({ sessionId, userLang, textEN: ackEN, prependNoticeIfNeeded: true });
+      const { canonical } = await toEnglishCanonical(finalText);
+      await saveMessage(sessionId, "assistant", canonical,
+        { category: "profile", strategy: "name_ack", meta: { name_confidence: 0.7 } },
+        "en", userLang, finalText, "profile");
+      return finalText;
+    }
   }
 
-  // Телефон (как раньше)
+  // Телефон
   const phone = detectPhone(userTextRaw);
   if (phone) await updateContact(sessionId, { phone });
 
-  // Сохраняем вход пользователя
+  // Сохраняем вход
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN, null, "en", userLang, origText, null
   );
 
-  // Если имени нет вообще — спросим (локализуем)
+  // Если имени нет — спросим
   const knownName = (nameInfo?.name) || session?.user_name?.trim();
   if (!knownName) {
     const askEN = buildAskName(userTextRaw, "en");
@@ -379,11 +405,13 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return finalText;
   }
 
-  // Оркестратор: решить следующий шаг (без кнопок, только текст)
-  let metaPatch = null;
+  // Оркестратор — решаем следующий шаг
+  let step = null;
   try {
-    const step = await decideNextStep({ session, text: userTextRaw, snapshot: getCatalogSnapshot() });
-    if (step?.metaPatch) metaPatch = step.metaPatch;
+    step = await decideNextStep({ session, text: userTextRaw, snapshot: getCatalogSnapshot() });
+    if (step?.metaPatch) {
+      try { await patchSessionMeta(sessionId, step.metaPatch); } catch {}
+    }
 
     if (step?.questionEN) {
       const { finalText, metaExtra } = await localizeForUser({
@@ -392,34 +420,33 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       const { canonical } = await toEnglishCanonical(finalText);
       await saveMessage(
         sessionId, "assistant", canonical,
-        { category: "orchestrator", strategy: "next_question", ...(metaPatch || {}), ...(metaExtra || {}) },
+        { category: "orchestrator", strategy: "next_question", ...(step.metaPatch || {}), ...(metaExtra || {}) },
         "en", userLang, finalText, "orchestrator"
       );
       return finalText;
     }
 
-    // Если оркестратор говорит «каталог пока не показывать»
     if (step?.blockCatalog) {
       let briefEN = await replyCore(sessionId, userTextEN);
       if (briefEN && briefEN.length > 900) briefEN = briefEN.slice(0, 850) + "…";
       const { finalText } = await localizeForUser({ sessionId, userLang, textEN: briefEN, prependNoticeIfNeeded: true });
       const { canonical } = await toEnglishCanonical(finalText);
       await saveMessage(sessionId, "assistant", canonical,
-        { category: "smalltalk", strategy: "brief_fallback", ...(metaPatch || {}) },
+        { category: "smalltalk", strategy: "brief_fallback", ...(step.metaPatch || {}) },
         "en", userLang, finalText, "smalltalk");
       return finalText;
     }
-  } catch (_) {
-    // мягкий фолбэк — игнорируем сбои оркестратора
-  }
+  } catch (_) {}
 
-  // 1) Пытаемся ответить из каталога
+  // Каталог (только если не заблокирован оркестратором)
   try {
-    const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
-    if (catAns) return catAns;
-  } catch (_) { /* soft fallback */ }
+    if (!step?.blockCatalog) {
+      const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
+      if (catAns) return catAns;
+    }
+  } catch (_) {}
 
-  // 2) KB → LLM (EN ядро → локализация)
+  // KB → LLM
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, "en");
@@ -455,7 +482,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
   await logReply(sessionId, strategy, category, kbItemId, userMsgId, null);
   await saveMessage(
     sessionId, "assistant", ansEN,
-    { category, strategy, ...(metaPatch || {}) },
+    { category, strategy, ...(step?.metaPatch || {}) },
     "en", userLang, finalText, category
   );
 
