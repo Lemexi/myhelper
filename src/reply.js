@@ -17,6 +17,9 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
+// 🔗 мягкая интеграция каталога (НЕ ломает остальную логику)
+import { findCatalogAnswer } from "./services.js";
+
 /* ───────────────── LLM fallback ───────────────── */
 async function replyCore(sessionId, userTextEN) {
   // Историю приводим к безопасному формату {role, content}
@@ -213,6 +216,34 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       "en", userLang, ask, "ask_name"
     );
     return ask;
+  }
+
+  /* ─────────────── Catalog (soft hint) ───────────────
+     Если запрос явно про вакансии/прайс/страны — services вернёт компактный текст.
+     Мы НЕ ломаем общую логику: если services ничего не даёт — идём по KB/LLM.
+  */
+  try {
+    const fromCatalog = await findCatalogAnswer(userTextRaw, userLang);
+    if (fromCatalog && typeof fromCatalog === "string" && fromCatalog.trim().length > 0) {
+      // Переводим под язык пользователя (services отвечает EN)
+      let outText = fromCatalog;
+      const detected = await detectLanguage(outText);
+      if (detected !== userLang) {
+        outText = (await translateCached(outText, detected, userLang)).text;
+      }
+
+      const { canonical } = await toEnglishCanonical(outText);
+      await logReply(sessionId, "services_hint", "catalog", null, userMsgId, null);
+      await saveMessage(
+        sessionId, "assistant", canonical,
+        { category: "catalog", strategy: "services_hint" },
+        "en", userLang, outText, "catalog"
+      );
+      return outText;
+    }
+  } catch (e) {
+    // Никогда не роняем поток из-за services: просто продолжаем KB/LLM
+    await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
   }
 
   // Классификация → KB → LLM
