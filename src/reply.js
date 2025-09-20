@@ -17,14 +17,17 @@ import {
 } from "./classifier.js";
 import { runLLM } from "./llm.js";
 
-// 🔗 Новый модуль каталога услуг/вакансий/цен
-// Ожидается файл /src/services.js, который экспортирует:
-// - findCatalogAnswer(rawText: string, userLang: string) -> Promise<{answer: string, meta?:object}|null>
-// - enrichExpensiveAnswer(baseText: string, userLang: string) -> Promise<string>
-import { findCatalogAnswer, enrichExpensiveAnswer } from "./services.js";
+// Catalog helpers
+// services.js exports:
+// - findCatalogAnswer(rawText, userLang?) -> { answer, meta? } | null
+// - enrichExpensiveAnswer(baseText, userLang?) -> string
+// - getCatalogSnapshot() -> { sig, openCountries: string[] }
+import { findCatalogAnswer, enrichExpensiveAnswer, getCatalogSnapshot } from "./services.js";
 
-/* ───────────────── LLM fallback ───────────────── */
+/* ───────────────── Internals ───────────────── */
+
 async function replyCore(sessionId, userTextEN) {
+  // Use only safe recent messages for LLM context
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
     .map(m => ({ role: m.role, content: String(m.content ?? "") }))
@@ -37,7 +40,7 @@ async function replyCore(sessionId, userTextEN) {
   if (summary) {
     messages.push({
       role: "system",
-      content: `Краткая сводка прошлой истории:\n${summary}`
+      content: `Brief recap of prior conversation:\n${summary}`
     });
   }
   messages.push(...recent);
@@ -48,32 +51,25 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* ───────────────── Просьба имени ───────────────── */
-function buildAskName(userLang, rawText) {
+function buildAskName(rawText) {
   const hi = extractGreeting(rawText);
-  const by = {
-    ru: `${hi ? hi + ". " : ""}Подскажите, пожалуйста, как вас зовут, чтобы я знал, как к вам обращаться?`,
-    uk: `${hi ? hi + ". " : ""}Підкажіть, будь ласка, як вас звати, щоб я знав, як до вас звертатися?`,
-    pl: `${hi ? hi + ". " : ""}Proszę podpowiedzieć, jak ma Pan/Pani na imię, żebym wiedział, jak się zwracać?`,
-    cz: `${hi ? hi + ". " : ""}Prosím, jak se jmenujete, ať vím, jak vás oslovovat?`,
-    en: `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`
-  };
-  return by[userLang] || by.en;
+  // user-facing text in EN by default
+  return `${hi ? hi + ". " : ""}May I have your name so I know how to address you?`;
 }
 
-/* ───────────────── Команды ───────────────── */
+/* ───────────────── Commands ───────────────── */
 
-async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
+async function handleCmdTranslate(sessionId, rawText, userLangHint = "en") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
   const targetLang = (targetLangWord ? targetLangWord : "en").toLowerCase();
 
   if (!text || text.length < 2) {
-    const msg = "Нужен текст после команды «Переведи».";
+    const msg = "Text is required after the 'Translate' command.";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "translate", strategy: "cmd_translate_error" },
-      "en", userLang, msg, "translate"
+      "en", userLangHint, msg, "translate"
     );
     return msg;
   }
@@ -86,53 +82,53 @@ async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
     });
 
   const combined =
-`🔍 Перевод (${tgt.toUpperCase()}):
+`🔍 Translation (${tgt.toUpperCase()}):
 ${styled}
 
-💬 Для тебя (RU):
+💬 RU helper:
 ${styledRu}`;
 
   const { canonical } = await toEnglishCanonical(combined);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: "translate", strategy: "cmd_translate" },
-    "en", userLang, combined, "translate"
+    "en", userLangHint, combined, "translate"
   );
 
   return combined;
 }
 
-async function handleCmdTeach(sessionId, rawText, userLang = "ru") {
+async function handleCmdTeach(sessionId, rawText, userLangHint = "en") {
   const taught = parseCmdTeach(rawText);
   if (!taught) {
-    const msg = "Нужен текст после «Ответил бы».";
+    const msg = "Text is required after 'Would answer…'.";
     const { canonical } = await toEnglishCanonical(msg);
     await saveMessage(
       sessionId, "assistant", canonical,
       { category: "teach", strategy: "cmd_teach_error" },
-      "en", userLang, msg, "teach"
+      "en", userLangHint, msg, "teach"
     );
     return msg;
   }
   const lastCat = (await getLastAuditCategory(sessionId)) || "general";
-  const kbId = await kbInsertAnswer(lastCat, userLang || "ru", taught, true);
+  const kbId = await kbInsertAnswer(lastCat, userLangHint || "en", taught, true);
 
-  const out = `✅ В базу добавлено.\n\n${taught}`;
+  const out = `✅ Added to knowledge base.\n\n${taught}`;
   const { canonical } = await toEnglishCanonical(out);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: lastCat, strategy: "cmd_teach", kb_id: kbId },
-    "en", userLang, out, lastCat
+    "en", userLangHint, out, lastCat
   );
   return out;
 }
 
-async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
-  const kb = (await kbFind("expensive", userLang)) || (await kbFind("expensive", "ru"));
+async function handleCmdAnswerExpensive(sessionId, userLangHint = "en") {
+  const kb = (await kbFind("expensive", userLangHint)) || (await kbFind("expensive", "en"));
   let answer;
   if (kb?.answer) {
-    answer = userLang !== "ru"
-      ? (await translateCached(kb.answer, "ru", userLang)).text
+    answer = userLangHint !== "en"
+      ? (await translateCached(kb.answer, "en", userLangHint)).text
       : kb.answer;
   } else {
     answer = await replyCore(
@@ -141,52 +137,105 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
     );
   }
 
-  // 💡 Добиваем конкретикой из каталога (цены/вилки/условия), если доступно
+  // Add factual ranges/prices from catalog if available
   try {
-    answer = await enrichExpensiveAnswer(answer, userLang);
-  } catch (_) { /* мягкий фолбэк */ }
+    answer = await enrichExpensiveAnswer(answer, userLangHint);
+  } catch (_) { /* soft fallback */ }
 
   const { canonical } = await toEnglishCanonical(answer);
   await saveMessage(
     sessionId, "assistant", canonical,
     { category: "expensive", strategy: "cmd_answer_expensive" },
-    "en", userLang, answer, "expensive"
+    "en", userLangHint, answer, "expensive"
   );
   await logReply(sessionId, "cmd", "expensive", kb?.id || null, null, "trigger: answer expensive");
   return answer;
 }
 
-/* ───────────────── Каталог (услуги/вакансии/цены) ───────────────── */
+/* ───────────────── Catalog helpers ───────────────── */
+
+// Try to find the last saved catalog snapshot (from previous assistant replies)
+async function loadLastCatalogSnapshotMeta(sessionId) {
+  const recentRaw = await loadRecentMessages(sessionId, 40); // raw with meta fields
+  if (!Array.isArray(recentRaw)) return null;
+
+  // Look backwards for assistant message with meta.snapshot
+  for (let i = recentRaw.length - 1; i >= 0; i--) {
+    const m = recentRaw[i];
+    if (m?.role !== "assistant") continue;
+    const meta = (m?.meta_json) || m?.meta || null;
+    if (meta && meta.snapshot && meta.snapshot.sig) {
+      return meta.snapshot; // { sig, openCountries }
+    }
+  }
+  return null;
+}
+
+// Compare old vs current and create a short change notice in EN
+function buildChangeNotice(prevSnap, currentSnap, focusCountry) {
+  if (!prevSnap || !currentSnap || prevSnap.sig === currentSnap.sig) return null;
+
+  const prevOpen = new Set((prevSnap.openCountries || []).map(c => c.toUpperCase()));
+  const currOpen = new Set((currentSnap.openCountries || []).map(c => c.toUpperCase()));
+
+  const opened = [...currOpen].filter(c => !prevOpen.has(c));
+  const closed = [...prevOpen].filter(c => !currOpen.has(c));
+
+  const parts = [];
+  if (focusCountry) {
+    const C = String(focusCountry).toUpperCase();
+    if (prevOpen.has(C) && !currOpen.has(C)) parts.push(`Heads up: ${C} is currently closed.`);
+    if (!prevOpen.has(C) && currOpen.has(C)) parts.push(`Good news: ${C} is open now.`);
+  } else {
+    if (opened.length) parts.push(`Newly open: ${opened.join(", ")}.`);
+    if (closed.length) parts.push(`Now closed: ${closed.join(", ")}.`);
+  }
+  if (!parts.length) return null;
+  return `🔄 Updates since your last visit:\n${parts.join(" ")}`;
+}
 
 async function tryCatalogAnswer(sessionId, rawText, userLang) {
-  // Пытаемся получить прямой ответ из каталога (по стране/компании/позиции/цене)
+  // Check changes vs last snapshot for transparency
+  const prevSnap = await loadLastCatalogSnapshotMeta(sessionId);
+  const currentSnap = getCatalogSnapshot();
+
   const hit = await findCatalogAnswer(rawText, userLang);
   if (!hit || !hit.answer) return null;
 
   const { answer, meta } = hit;
-  const { canonical } = await toEnglishCanonical(answer);
+
+  // If meta knows the country, use it for targeted notice
+  const focusCountry = meta?.country || null;
+  const notice = buildChangeNotice(prevSnap, currentSnap, focusCountry);
+
+  const finalAnswer = notice ? `${notice}\n\n${answer}` : answer;
+
+  const { canonical } = await toEnglishCanonical(finalAnswer);
+
+  // Persist with meta including current snapshot for future diffs
+  const metaToSave = Object.assign({}, meta || {}, { snapshot: currentSnap });
 
   await saveMessage(
     sessionId, "assistant", canonical,
-    { category: "catalog", strategy: "catalog_hit", meta: meta || null },
-    "en", userLang, answer, "catalog"
+    { category: "catalog", strategy: "catalog_hit", ...metaToSave },
+    "en", userLang, finalAnswer, "catalog"
   );
   await logReply(sessionId, "catalog", "catalog", null, null, meta ? JSON.stringify(meta) : null);
 
-  return answer;
+  return finalAnswer;
 }
 
 /* ───────────────── SmartReply ───────────────── */
 
-export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
+export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "en") {
   const sessionId = await upsertSession(sessionKey, channel);
 
-  // Канонизируем вход
+  // Normalize input
   const { canonical: userTextEN, sourceLang: srcLang, original: origText } =
     await toEnglishCanonical(userTextRaw);
-  const userLang = srcLang || userLangHint;
+  const userLang = srcLang || userLangHint || "en";
 
-  // Команды
+  // Commands
   if (isCmdTeach(userTextRaw)) {
     const msgId = await saveMessage(
       sessionId, "user", userTextEN,
@@ -210,7 +259,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       await logReply(sessionId, "cmd", "translate", null, msgId, "trigger: translate");
       return out;
     } else {
-      const msg = "Нужен текст после команды «Переведи».";
+      const msg = "Text is required after the 'Translate' command.";
       const { canonical } = await toEnglishCanonical(msg);
       await saveMessage(
         sessionId, "assistant", canonical,
@@ -232,22 +281,22 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return out;
   }
 
-  // Имя / телефон
+  // Name / phone updates
   const nameInThisMsg = detectAnyName(userTextRaw);
   const phone = detectPhone(userTextRaw);
   if (nameInThisMsg || phone) await updateContact(sessionId, { name: nameInThisMsg, phone });
 
-  // Сохраняем вход пользователя
+  // Persist user message
   const userMsgId = await saveMessage(
     sessionId, "user", userTextEN,
     null, "en", userLang, origText, null
   );
 
-  // Если имени нет — спросим
+  // Ask for name if unknown
   const session = await getSession(sessionId);
   const knownName = nameInThisMsg || session?.user_name?.trim();
   if (!knownName) {
-    const ask = buildAskName(userLang, userTextRaw);
+    const ask = buildAskName(userTextRaw);
     const { canonical } = await toEnglishCanonical(ask);
     await saveMessage(
       sessionId, "assistant", canonical,
@@ -257,15 +306,15 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return ask;
   }
 
-  // 🆕 Попытка ответить из каталога услуг/вакансий/цен
+  // Try answering from the services catalog first
   try {
     const catAns = await tryCatalogAnswer(sessionId, userTextRaw, userLang);
     if (catAns) return catAns;
   } catch (_) {
-    // мягкий фолбэк — никаких исключений наружу
+    // soft fallback
   }
 
-  // Классификация → KB → LLM
+  // KB → LLM fallback
   const category = await classifyCategory(userTextRaw);
 
   let kb = await kbFind(category, userLang);
@@ -276,18 +325,18 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     strategy = "kb_hit";
     kbItemId = kb.id;
   } else {
-    const kbRu = await kbFind(category, "ru");
-    if (kbRu) {
-      answer = (await translateCached(kbRu.answer, "ru", userLang)).text;
+    const kbEN = await kbFind(category, "en");
+    if (kbEN) {
+      answer = (await translateCached(kbEN.answer, "en", userLang)).text;
       strategy = "kb_translated";
-      kbItemId = kbRu.id;
+      kbItemId = kbEN.id;
     }
   }
 
   if (!answer) {
     answer = await replyCore(sessionId, userTextEN);
     const detectedLLM = await detectLanguage(answer);
-    if (detectedLLM !== userLang) {
+    if (detectedLLM && detectedLLM !== userLang) {
       answer = (await translateCached(answer, detectedLLM, userLang)).text;
     }
   }
