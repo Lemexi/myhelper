@@ -48,6 +48,12 @@
       "accommodation": { "provided": true, "cost_per_month": 300, "note": "employee pays ~€300–350/month" },
       "transport_to_work": "independently (travel document issued by the employer)",
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": true,
+        "candidate_video_resume_required": false,
+        "portfolio_video_required": false,
+        "notes": "Employer conducts a short video interview before confirmation."
+      },
       "notes": "Finishing works, OHS/HSE compliance mandatory"
     },
 
@@ -69,6 +75,12 @@
       "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
       "transport_to_work": true,
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": false,
+        "candidate_video_resume_required": false,
+        "portfolio_video_required": false,
+        "notes": "Video interview can be arranged on request; not required for approval."
+      },
       "notes": "Trail clearing, bushes trimming, planting support, seasonal forestry assistance"
     },
     {
@@ -89,6 +101,12 @@
       "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
       "transport_to_work": true,
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": false,
+        "candidate_video_resume_required": false,
+        "portfolio_video_required": false,
+        "notes": "Optional video interview available on request."
+      },
       "notes": "Warehouse & production: sorting, packing, marking"
     },
     {
@@ -109,6 +127,11 @@
       "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
       "transport_to_work": true,
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": false,
+        "candidate_video_resume_required": false,
+        "portfolio_video_required": false
+      },
       "notes": "Storage, plastic goods warehousing, sorting/packing, documentation"
     },
     {
@@ -129,6 +152,11 @@
       "accommodation": { "provided": true, "cost_per_month": 280, "note": "employee pays ~€250–300/month" },
       "transport_to_work": true,
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": false,
+        "candidate_video_resume_required": false,
+        "portfolio_video_required": false
+      },
       "notes": "Cleaning buildings, preparing objects, auxiliary construction tasks"
     },
 
@@ -137,8 +165,8 @@
       "country": "RS",
       "company": "TBD (Serbia)",
       "city": "Belgrade",
-      "position": "Warehouse / Helper",
-      "sex": "Male/Female",
+      "position": "Welder (MIG/MAG) / Helper",
+      "sex": "Male",
       "age": "18–55",
       "employment_period": "TBD",
       "salary_text": "TBD",
@@ -146,6 +174,12 @@
       "accommodation": { "provided": true, "cost_per_month": null, "note": "TBD" },
       "transport_to_work": false,
       "meals_provided": false,
+      "interview": {
+        "employer_video_required": true,
+        "candidate_video_resume_required": true,
+        "portfolio_video_required": true,
+        "notes": "Short self-introduction video and recent welding works video required."
+      },
       "notes": "Will be added after Demand Letter confirmation"
     }
   ]
