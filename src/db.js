@@ -50,7 +50,6 @@ export async function getSession(sessionId) {
     WHERE id=$1
   `;
   const { rows } = await pool.query(q, [sessionId]);
-  // возвращаем поле meta как объект (или пустой)
   const row = rows[0] || null;
   if (!row) return null;
   return {
@@ -58,12 +57,11 @@ export async function getSession(sessionId) {
     user_name: row.user_name,
     user_phone: row.user_phone,
     locale: row.locale,
-    // orchestrator JSONB может лежать в meta / orchestrator
     meta_json: row.meta || {}
   };
 }
 
-/** Патч jsonb-поля orchestrator: глубокое объединение верхнего уровня */
+/** Патч jsonb-поля orchestrator (верхнеуровневое объединение) */
 export async function patchSessionMeta(sessionId, patchObj = {}) {
   if (!patchObj || typeof patchObj !== "object") return;
 
@@ -82,10 +80,10 @@ export async function saveMessage(
   sessionId,
   role,
   content,
-  meta = null,            // объект → meta_json (jsonb)
-  lang = null,           // язык исходного content
-  translated_to = null,  // язык локализации, если есть
-  translated_content = null, // локализованный текст (для отображения пользователю)
+  meta = null,                // объект → meta_json (jsonb)
+  lang = null,               // язык исходного content
+  translated_to = null,      // язык локализации (если есть)
+  translated_content = null, // локализованный текст
   category = null
 ) {
   const q = `
