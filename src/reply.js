@@ -20,6 +20,13 @@ import { runLLM } from "./llm.js";
 // Каталог — факты только из catalog.json
 import { findCatalogAnswer, getCatalogSnapshot } from "./services.js";
 
+/* ───────────────── Константы ───────────────── */
+
+// Категории, где ИСКЛЮЧИТЕЛЬНО каталог, без LLM
+const CATALOG_CATS = new Set([
+  "vacancies", "jobs", "catalog", "positions", "countries_overview", "vacancy_detail"
+]);
+
 /* ───────────────── Вспомогательные ───────────────── */
 
 // Когда точно включать каталог (и только тогда)
@@ -28,13 +35,15 @@ function shouldUseCatalog(raw) {
 
   const vacancySignals = [
     "ваканс", "позици", "какие есть", "что доступно", "что у вас есть",
-    "список", "каталог", "доступные", "available positions", "what do you have",
-    "what positions", "countries available", "open countries", "направлени"
+    "список", "каталог", "доступные", "должност", "направлени",
+    "available positions", "what do you have", "what positions",
+    "countries available", "open countries",
+    "польша", "чехи", "серби", "литв", "латв", "estoni", "герман", "slovak", "romani"
   ];
 
   const blockIf = [
     "оплат", "платеж", "счёт", "инвойс", "виза", "гаранти",
-    "partner", "партнер", "b2b", "сотруднич", "условия оплаты"
+    "partner", "партнер", "партнёр", "b2b", "сотруднич", "условия оплаты"
   ];
 
   if (blockIf.some(w => t.includes(w))) return false;
@@ -118,6 +127,7 @@ function buildWarmIntro(userLang = "ru", knownName = null) {
 
   return by[userLang] || by.en;
 }
+
 /* ───────────────── Команды ───────────────── */
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
@@ -264,13 +274,12 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
 
   // Тёплое персональное приветствие (только первый ответ)
   if (noAssistantYet) {
-    // Узнаем уже сохранённое имя (или из текущего сообщения)
     const session = await getSession(sessionId);
     const knownName = nameInThisMsg || session?.user_name?.trim() || null;
 
-    // Сигнал «это про вакансии»? Тогда отдадим приветствие + короткий тизер каталога.
     let outText = buildWarmIntro(userLang, knownName);
 
+    // Если первый вход уже про вакансии — добавим тизер каталога (без LLM)
     if (shouldUseCatalog(userTextRaw)) {
       try {
         const teaserRes = await findCatalogAnswer(userTextRaw, userLang);
@@ -292,18 +301,11 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return outText;
   }
 
-  // Дальше — не спрашиваем имя proactively (чтобы не раздражать)
-  // Если нужно — можно включить ваш старый precheck имени тут.
-
   // Интент
   const category = await classifyCategory(userTextRaw);
 
-  // Жёсткая проверка на каталог (если классификатор промахнулся)
-  const allowCatalogByCategory = new Set([
-    "vacancies", "jobs", "catalog", "positions", "countries_overview", "vacancy_detail"
-  ]);
-  const useCatalog = allowCatalogByCategory.has(category) || shouldUseCatalog(userTextRaw);
-
+  // Жёсткий guard: всё про вакансии/страны/позиции — только каталог (никакого LLM)
+  const useCatalog = CATALOG_CATS.has(category) || shouldUseCatalog(userTextRaw);
   if (useCatalog) {
     try {
       const res = await findCatalogAnswer(userTextRaw, userLang);
@@ -322,23 +324,33 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
           "en", userLang, text, "catalog"
         );
         return text;
-      } else {
-        const snap = getCatalogSnapshot();
-        const opts = (snap.openCountries || []).join(", ");
-        const safe = opts
-          ? `Сейчас открыты направления: ${opts}. Назовите страну и позицию — вышлю условия и чек-лист.`
-          : "Набор временно закрыт. Могу поставить вас в приоритет и уведомить об открытии.";
-        const { canonical } = await toEnglishCanonical(safe);
-        await saveMessage(
-          sessionId, "assistant", canonical,
-          { category: "catalog", strategy: "catalog_snapshot" },
-          "en", userLang, safe, "catalog"
-        );
-        return safe;
       }
+
+      // Каталог ответил пусто → корректный дефолт без LLM
+      const snap = getCatalogSnapshot();
+      const opts = (snap.openCountries || []).join(", ");
+      const safe = opts
+        ? `Сейчас открыты направления: ${opts}. Назовите страну и позицию — вышлю условия и чек-лист.`
+        : "Набор временно закрыт. Могу поставить вас в приоритет и уведомить об открытии.";
+      const { canonical } = await toEnglishCanonical(safe);
+      await saveMessage(
+        sessionId, "assistant", canonical,
+        { category: "catalog", strategy: "catalog_snapshot" },
+        "en", userLang, safe, "catalog"
+      );
+      return safe;
+
     } catch (e) {
+      // Ошибка сервиса — даём безопасный дефолт и ВЫХОДИМ (никакого LLM по вакансиям)
       await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
-      // продолжаем KB/LLM ниже
+      const fallback = "Понимаю. Напишите страну и позицию — проверю доступность и пришлю условия.";
+      const { canonical } = await toEnglishCanonical(fallback);
+      await saveMessage(
+        sessionId, "assistant", canonical,
+        { category: "catalog", strategy: "catalog_guard_fallback" },
+        "en", userLang, fallback, "catalog"
+      );
+      return fallback;
     }
   }
 
