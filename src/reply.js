@@ -73,18 +73,51 @@ async function replyCore(sessionId, userTextEN) {
 
 /* ───────────────── Приветствие ───────────────── */
 
-function buildWarmIntro(userLang = "ru", knownName = null) {
-  const n = knownName ? (knownName.trim() + "! ") : "";
+function namePleasantry(lang, name) {
+  if (!name) return "";
   const by = {
-    ru: `Здравствуйте, ${n}Меня зовут Виктор Шиманский, я генеральный менеджер Renovogo.com. Спасибо, что обратились. Чем могу вам помочь — страна, позиция, ставка, сроки?`,
-    uk: `Вітаю, ${n}Мене звати Віктор Шиманський, я генеральний менеджер Renovogo.com. Дякую за звернення. Чим можу допомогти — країна, позиція, ставка, строки?`,
-    pl: `Dzień dobry, ${n}Nazywam się Wiktor Szymański, jestem general managerem w Renovogo.com. Dziękuję za kontakt. W czym mogę pomóc — kraj, stanowisko, stawka, terminy?`,
-    cz: `Dobrý den, ${n}Jmenuji se Viktor Szymanski, generální manažer Renovogo.com. Děkuji za zprávu. S čím mohu pomoci — země, pozice, sazba, termín?`,
-    en: `Hello, ${n}I’m Viktor Szymanski, GM at Renovogo.com. Thanks for reaching out. How can I help — country, role, net rate, timing?`
+    ru: `Очень приятно познакомиться, ${name}. `,
+    uk: `Дуже приємно познайомитися, ${name}. `,
+    pl: `Miło mi poznać, ${name}. `,
+    cz: `Těší mě, ${name}. `,
+    en: `Nice to meet you, ${name}. `
   };
-  return by[userLang] || by.en;
+  return by[lang] || by.en;
 }
 
+function greetingWithName(lang, name) {
+  if (!name) {
+    return {
+      ru: "Здравствуйте. ",
+      uk: "Вітаю. ",
+      pl: "Dzień dobry. ",
+      cz: "Dobrý den. ",
+      en: "Hello. "
+    }[lang] || "Hello. ";
+  }
+  return {
+    ru: `Здравствуйте, ${name}! `,
+    uk: `Вітаю, ${name}! `,
+    pl: `Dzień dobry, ${name}! `,
+    cz: `Dobrý den, ${name}! `,
+    en: `Hello, ${name}! `
+  }[lang] || `Hello, ${name}! `;
+}
+
+function buildWarmIntro(userLang = "ru", knownName = null) {
+  const greet = greetingWithName(userLang, knownName);
+  const nice  = namePleasantry(userLang, knownName);
+
+  const by = {
+    ru: `${greet}Меня зовут Виктор Шиманский, я генеральный менеджер Renovogo.com. Спасибо, что обратились к нам. ${nice}Чем я могу вам помочь?`,
+    uk: `${greet}Мене звати Віктор Шиманський, я генеральний менеджер Renovogo.com. Дякую, що звернулися до нас. ${nice}Чим я можу допомогти?`,
+    pl: `${greet}Nazywam się Wiktor Szymański, jestem general managerem w Renovogo.com. Dziękuję za kontakt. ${nice}W czym mogę pomóc?`,
+    cz: `${greet}Jmenuji se Viktor Szymanski, jsem generální manažer Renovogo.com. Děkuji za zprávu. ${nice}S čím mohu pomoci?`,
+    en: `${greet}I’m Viktor Szymanski, General Manager at Renovogo.com. Thanks for reaching out. ${nice}How can I help?`
+  };
+
+  return by[userLang] || by.en;
+}
 /* ───────────────── Команды ───────────────── */
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
