@@ -44,12 +44,13 @@ function shouldUseCatalog(raw) {
     "список", "каталог", "доступные", "должност", "направлени",
     "available positions", "what do you have", "what positions",
     "countries available", "open countries",
-    "польша", "чехи", "серби", "литв", "латв", "estoni", "герман", "slovak", "romani", "poland", "czech", "serbia", "lithuania", "latvia"
+    "польша", "чехи", "серби", "литв", "латв", "estoni", "герман", "slovak", "romani",
+    "poland", "czech", "serbia", "lithuania", "latvia"
   ];
 
   // Если текст явным образом про оплату/партнёрство — даём шанс другим веткам
   const blockIf = [
-    "оплат", "платеж", "счёт", "инвойс", "виза", "гаранти", // гаранти попадает под RE_INTENT_GUARANTEE
+    "оплат", "платеж", "счёт", "инвойс", "виза", "гаранти", // гаранти поймает RE_INTENT_GUARANTEE
     "partner", "партнер", "партнёр", "b2b", "сотруднич", "условия оплаты"
   ];
 
