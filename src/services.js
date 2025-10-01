@@ -91,7 +91,8 @@ const POSITION_SYNONYMS = {
   loader:    ["loader", "грузчик", "докер"],
   cook:      ["cook", "kitchen", "повар", "кухн"],
   painter:   ["painter", "plasterer", "маляр", "штукатур", "finishing", "отделоч"],
-  helper:    ["helper", "подсоб", "помощник", "laborer"]
+  // расширено: строитель/разнорабочий
+  helper:    ["helper", "подсоб", "помощник", "laborer", "builder", "строител", "строит", "рабочий", "разнорабоч"]
 };
 function detectPositionKey(text) {
   const t = norm(text);
@@ -243,7 +244,7 @@ export async function findCatalogAnswer(rawText, _userLang = "ru") {
     if (askedPositionKey) {
       const found = findByPositionAcrossCountries(catalog, askedPositionKey);
       if (found.size === 0) {
-        return "Такой позиции сейчас нет в активном наборе. Могу предложить склад/производство."
+        return "Такой позиции сейчас нет в активном наборе. Могу предложить склад/производство.";
       }
       if (found.size === 1) {
         // Единственная страна — сразу карточки
@@ -266,7 +267,7 @@ export async function findCatalogAnswer(rawText, _userLang = "ru") {
       return `Эта позиция доступна в:\n${lines.join("\n")}\n\nНазовите страну — пришлю полные условия.`;
     }
 
-    // Общий обзор: страна → список позиций
+    // Общий обзор: страна → список позиций (БЕЗ зарплат)
     const lines = availableCountries.map(code => {
       const label = COUNTRY_LABEL[code] || code;
       const list = activeByCountry.get(code) || [];
@@ -309,18 +310,18 @@ export async function findCatalogAnswer(rawText, _userLang = "ru") {
     return `${COUNTRY_LABEL[code] || code}: доступны позиции — ${pos}.${docLine}\nУточните позицию — отправлю условия.`;
   }
 
-  // Если запрос общим списком — кратко перечислим; при явном "детали" — карточки
+  // Если запрос общим списком — КРАТКИЙ список позиций (БЕЗ зарплат);
+  // при явном "детали" или выбранной позиции — карточки
   const demand = countryPages[code]?.demand;
   const contract = countryPages[code]?.contract;
 
   if (!wantDetail && !askedPositionKey) {
-    // Обзор по стране
-    const brief = uniq(matches.map(v => `${title(v.position)} — ${formatSalaryShort(v)}`)).slice(0, 5).join(" | ");
+    const namesOnly = uniq(matches.map(v => title(v.position))).slice(0, 5).join(", ");
     const docs = [];
     if (demand)   docs.push(`demand: ${demand}`);
     if (contract) docs.push(`contract: ${contract}`);
     const docLine = docs.length ? `\nДокументы: ${docs.join(" · ")}` : "";
-    return `${COUNTRY_LABEL[code] || code}: ${brief}.${docLine}\nНапишите позицию — пришлю полные условия.`;
+    return `${COUNTRY_LABEL[code] || code}: ${namesOnly}.${docLine}\nНапишите позицию — пришлю полные условия.`;
   }
 
   // Полные условия (карточки). Если выбрана позиция — отдадим карточки этой позиции; иначе — топ-3.
