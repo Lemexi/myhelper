@@ -20,16 +20,22 @@ import { runLLM } from "./llm.js";
 // Каталог — факты только из catalog.json
 import { findCatalogAnswer, getCatalogSnapshot } from "./services.js";
 
-/* ───────────────── Константы ───────────────── */
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 1. КОНСТАНТЫ И ФЛАГИ
+ * ──────────────────────────────────────────────────────────── */
 
 // Категории, где ИСКЛЮЧИТЕЛЬНО каталог, без LLM
 const CATALOG_CATS = new Set([
   "vacancies", "jobs", "catalog", "positions", "countries_overview", "vacancy_detail"
 ]);
 
-/* ───────────────── Вспомогательные ───────────────── */
+// Интент "гарантии/доверие" — для ANSWER-FIRST
+const RE_INTENT_GUARANTEE = /(гарант|безопас|довер|обман|мошенн|scam|fraud|guarantee|trust|verify|legality|legal)/i;
 
-// Когда точно включать каталог (и только тогда)
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 2. ХЕЛПЕРЫ И ДЕТЕКТОРЫ
+ * ──────────────────────────────────────────────────────────── */
+
 function shouldUseCatalog(raw) {
   const t = String(raw || "").toLowerCase();
 
@@ -38,11 +44,12 @@ function shouldUseCatalog(raw) {
     "список", "каталог", "доступные", "должност", "направлени",
     "available positions", "what do you have", "what positions",
     "countries available", "open countries",
-    "польша", "чехи", "серби", "литв", "латв", "estoni", "герман", "slovak", "romani"
+    "польша", "чехи", "серби", "литв", "латв", "estoni", "герман", "slovak", "romani", "poland", "czech", "serbia", "lithuania", "latvia"
   ];
 
+  // Если текст явным образом про оплату/партнёрство — даём шанс другим веткам
   const blockIf = [
-    "оплат", "платеж", "счёт", "инвойс", "виза", "гаранти",
+    "оплат", "платеж", "счёт", "инвойс", "виза", "гаранти", // гаранти попадает под RE_INTENT_GUARANTEE
     "partner", "партнер", "партнёр", "b2b", "сотруднич", "условия оплаты"
   ];
 
@@ -55,7 +62,10 @@ function isNameInquiry(raw) {
   return /(как\s+вас\s+зовут|как\s+к\s+вам\s+обращаться|your\s+name)/i.test(t);
 }
 
-/* ───────────────── LLM fallback ───────────────── */
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 3. LLM FALLBACK (Answer-first логика живёт выше в роутере)
+ * ──────────────────────────────────────────────────────────── */
+
 async function replyCore(sessionId, userTextEN) {
   const recentRaw = await loadRecentMessages(sessionId, 24);
   const recent = (recentRaw || [])
@@ -80,7 +90,9 @@ async function replyCore(sessionId, userTextEN) {
   return text;
 }
 
-/* ───────────────── Приветствие ───────────────── */
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 4. ПРИВЕТСТВИЕ
+ * ──────────────────────────────────────────────────────────── */
 
 function namePleasantry(lang, name) {
   if (!name) return "";
@@ -128,7 +140,9 @@ function buildWarmIntro(userLang = "ru", knownName = null) {
   return by[userLang] || by.en;
 }
 
-/* ───────────────── Команды ───────────────── */
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 5. ОБРАБОТЧИКИ КОМАНД
+ * ──────────────────────────────────────────────────────────── */
 
 async function handleCmdTranslate(sessionId, rawText, userLang = "ru") {
   const { targetLangWord, text } = parseCmdTranslate(rawText);
@@ -213,7 +227,9 @@ async function handleCmdAnswerExpensive(sessionId, userLang = "ru") {
   return answer;
 }
 
-/* ───────────────── SmartReply ───────────────── */
+/* ────────────────────────────────────────────────────────────
+ * БЛОК 6. SMART REPLY — ГЛАВНЫЙ РОУТЕР
+ * ──────────────────────────────────────────────────────────── */
 
 export async function smartReply(sessionKey, channel, userTextRaw, userLangHint = "ru") {
   const sessionId = await upsertSession(sessionKey, channel);
@@ -301,10 +317,36 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     return outText;
   }
 
-  // Интент
+  // ── ANSWER-FIRST: прямые вопросы про гарантии/легальность
+  if (RE_INTENT_GUARANTEE.test(userTextRaw)) {
+    const ans = {
+      ru: [
+        "Работаем только легально: официальный договор с работодателем и договор о сотрудничестве, реквизиты проверяемы.",
+        "Оплата по счёту — после проверки документов и согласования условий.",
+        "Шаблоны и чек-лист доступны на сайте по странам.",
+        "Предлагаю старт с пилота на 1–2 кандидата, чтобы вы увидели процесс; с какой страны начнём?"
+      ].join(" "),
+      en: [
+        "We work only legally: employer contract + cooperation agreement, verifiable details.",
+        "Payment by invoice after document checks and agreed terms.",
+        "Templates and checklist are available on our site by country.",
+        "Let’s start with a 1–2 candidate pilot so you can see the process; which country suits you to start?"
+      ].join(" ")
+    };
+    const text = userLang === "ru" ? ans.ru : ans.en;
+    const { canonical } = await toEnglishCanonical(text);
+    await saveMessage(
+      sessionId, "assistant", canonical,
+      { category: "guarantee", strategy: "answer_first" },
+      "en", userLang, text, "guarantee"
+    );
+    return text;
+  }
+
+  // Интент от классификатора
   const category = await classifyCategory(userTextRaw);
 
-  // Жёсткий guard: всё про вакансии/страны/позиции — только каталог (никакого LLM)
+  // ── Жёсткий guard: всё про вакансии/страны/позиции — только каталог (никакого LLM)
   const useCatalog = CATALOG_CATS.has(category) || shouldUseCatalog(userTextRaw);
   if (useCatalog) {
     try {
@@ -341,7 +383,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
       return safe;
 
     } catch (e) {
-      // Ошибка сервиса — даём безопасный дефолт и ВЫХОДИМ (никакого LLM по вакансиям)
+      // Ошибка сервиса — даём безопасный дефолт и выходим (никакого LLM по вакансиям)
       await logReply(sessionId, "services_error", "catalog", null, userMsgId, String(e?.message || e));
       const fallback = "Понимаю. Напишите страну и позицию — проверю доступность и пришлю условия.";
       const { canonical } = await toEnglishCanonical(fallback);
@@ -354,7 +396,7 @@ export async function smartReply(sessionKey, channel, userTextRaw, userLangHint 
     }
   }
 
-  // KB → перевод → LLM
+  // ── KB → перевод → LLM (общие темы, не каталог)
   let kb = await kbFind(category, userLang);
   let answer, strategy = "fallback_llm", kbItemId = null;
 
